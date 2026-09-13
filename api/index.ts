@@ -1,96 +1,52 @@
+import { randomBytes } from 'node:crypto';
 import { app } from '../src/server.js';
 import { ensureDatabase, getPool, pingDatabase } from '../src/db.js';
+import { clearCsrfCookie, clearSessionCookie, createAuthToken, createPasswordHash, csrfCookie, getCookie, randomToken, sessionCookie, sha256, verifyAuthToken, verifyPassword, SESSION_COOKIE, CSRF_COOKIE } from '../src/auth.js';
 
-function paymentRouteInfo(request: any) {
-  const path = String(request.url ?? '').split('?')[0];
-  const match = path.match(/^\/api\/v1\/payment-links\/([^/]+)\/pay\/(bkash|nagad)$/);
-  const key = typeof request.headers?.['idempotency-key'] === 'string' ? request.headers['idempotency-key'].trim() : '';
-  if (request.method !== 'POST' || !match || !key) return null;
-  return { paymentLinkId: match[1], provider: match[2] as 'bkash' | 'nagad', key };
-}
+const SESSION_MAX_AGE = 60 * 60 * 24 * 7;
+function paymentRouteInfo(request: any) { const path = String(request.url ?? '').split('?')[0]; const match = path.match(/^\/api\/v1\/payment-links\/([^/]+)\/pay\/(bkash|nagad)$/); const key = typeof request.headers?.['idempotency-key'] === 'string' ? request.headers['idempotency-key'].trim() : ''; if (request.method !== 'POST' || !match || !key) return null; return { paymentLinkId: match[1], provider: match[2] as 'bkash' | 'nagad', key }; }
+function json(response: any, status: number, body: unknown, headers: Record<string, string> = {}) { response.statusCode = status; response.setHeader('Content-Type', 'application/json; charset=utf-8'); for (const [key, value] of Object.entries(headers)) response.setHeader(key, value); response.end(JSON.stringify(body)); }
+function requestId(request: any) { const supplied = String(request.headers?.['x-request-id'] ?? '').trim(); return /^[A-Za-z0-9._:-]{8,100}$/.test(supplied) ? supplied : randomBytes(12).toString('hex'); }
+function clientIp(request: any) { const forwarded = String(request.headers?.['x-forwarded-for'] ?? '').split(',')[0]?.trim(); return forwarded || String(request.socket?.remoteAddress ?? 'unknown').slice(0, 80); }
+function appendSetCookie(response: any, values: string[]) { const current = response.getHeader('Set-Cookie'); const existing = Array.isArray(current) ? current.map(String) : current ? [String(current)] : []; response.setHeader('Set-Cookie', [...existing, ...values]); }
+function parseJsonBody(raw: any) { if (!raw) return {}; if (typeof raw === 'object') return raw; try { return JSON.parse(Buffer.isBuffer(raw) ? raw.toString('utf8') : String(raw)); } catch { return {}; } }
+async function sendEmail(to: string, subject: string, html: string) { const apiKey = process.env.RESEND_API_KEY; const from = process.env.RESEND_FROM_EMAIL || process.env.FROM_EMAIL; if (!apiKey || !from) return false; const response = await fetch('https://api.resend.com/emails', { method: 'POST', headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ from, to: [to], subject, html }) }); return response.ok; }
+async function createSession(merchantId: string, token: string) { const csrf = randomToken(32); await getPool().query("INSERT INTO auth_sessions(merchant_id,token_hash,csrf_token,expires_at) VALUES($1,$2,$3,NOW()+INTERVAL '7 days')", [merchantId, sha256(token), csrf]); return csrf; }
+async function currentSession(request: any) { const token = getCookie(request, SESSION_COOKIE); if (!token) return null; const auth = verifyAuthToken(token); if (!auth) return null; const csrf = getCookie(request, CSRF_COOKIE); const method = String(request.method ?? 'GET').toUpperCase(); if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) { const supplied = String(request.headers?.['x-csrf-token'] ?? ''); if (!csrf || !supplied || csrf.length !== 64 || supplied.length !== 64 || csrf !== supplied) return { invalidCsrf: true }; } const result = await getPool().query(`SELECT s.id,s.merchant_id,s.csrf_token,s.expires_at,m.status,m.name,m.email,m.email_verified_at FROM auth_sessions s JOIN merchants m ON m.id=s.merchant_id WHERE s.token_hash=$1 AND s.revoked_at IS NULL AND s.expires_at>NOW() LIMIT 1`, [sha256(token)]); if (!result.rowCount || result.rows[0].status !== 'ACTIVE') return null; await getPool().query('UPDATE auth_sessions SET last_seen_at=NOW() WHERE id=$1', [result.rows[0].id]); return { token, auth, session: result.rows[0] }; }
+async function revokeAllSessions(merchantId: string) { await getPool().query('UPDATE auth_sessions SET revoked_at=NOW() WHERE merchant_id=$1 AND revoked_at IS NULL', [merchantId]); }
+async function rateLimit(request: any, key: string, limit: number, windowSeconds = 60) { await getPool().query('CREATE TABLE IF NOT EXISTS security_rate_limits(key VARCHAR(180) NOT NULL, window_start BIGINT NOT NULL, count INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(key,window_start))'); const bucket = Math.floor(Date.now() / 1000 / windowSeconds); const id = `${key}:${clientIp(request)}:${bucket}`; const result = await getPool().query(`INSERT INTO security_rate_limits(key,window_start,count) VALUES($1,$2,1) ON CONFLICT(key,window_start) DO UPDATE SET count=security_rate_limits.count+1 RETURNING count`, [id, bucket]); return Number(result.rows[0].count) <= limit; }
+function verificationUrl(token: string) { const base = process.env.FRONTEND_URL?.replace(/\/$/, ''); return base ? `${base}/verify-email?token=${encodeURIComponent(token)}` : null; }
+function resetUrl(token: string) { const base = process.env.FRONTEND_URL?.replace(/\/$/, ''); return base ? `${base}/reset-password?token=${encodeURIComponent(token)}` : null; }
 
 export default async function handler(request: any, response: any) {
-  let lockClient: any;
-  let lockReleased = false;
-  const releaseLock = async () => {
-    if (!lockClient || lockReleased) return;
-    lockReleased = true;
-    try { await lockClient.query('SELECT pg_advisory_unlock(hashtextextended($1, 0))', [paymentRouteInfo(request)?.key ?? '']); } catch (error) { console.error('LalaPay idempotency unlock failed:', error instanceof Error ? error.message : 'unknown error'); }
-    try { lockClient.release(); } catch { /* already released */ }
-    lockClient = undefined;
-  };
-
+  let lockClient: any; let lockReleased = false; const rid = requestId(request); response.setHeader('X-Request-ID', rid); request.headers['x-request-id'] = rid;
+  const releaseLock = async () => { if (!lockClient || lockReleased) return; lockReleased = true; try { await lockClient.query('SELECT pg_advisory_unlock(hashtextextended($1, 0))', [paymentRouteInfo(request)?.key ?? '']); } catch {} try { lockClient.release(); } catch {} lockClient = undefined; };
   try {
-    const path = String(request.url ?? '').split('?')[0];
+    await ensureDatabase(); const path = String(request.url ?? '').split('?')[0];
+    if (path === '/health/ready') { try { await pingDatabase(); json(response, 200, { status: 'ready', service: 'lalapay-api' }); } catch { json(response, 503, { status: 'not_ready', service: 'lalapay-api', database: false }); } return; }
 
-    if (path === '/health/ready') {
-      try {
-        await pingDatabase();
-        response.statusCode = 200;
-        response.setHeader('Content-Type', 'application/json; charset=utf-8');
-        response.end(JSON.stringify({ status: 'ready', service: 'lalapay-api' }));
-      } catch (error) {
-        console.error('LalaPay readiness check failed:', error instanceof Error ? error.message : 'unknown error');
-        response.statusCode = 503;
-        response.setHeader('Content-Type', 'application/json; charset=utf-8');
-        response.end(JSON.stringify({ status: 'not_ready', service: 'lalapay-api', database: false }));
-      }
-      return;
-    }
+    if (path === '/api/v1/auth/logout' && request.method === 'POST') { const session = await currentSession({ ...request, method: 'GET' }); if (session && !(session as any).invalidCsrf) await getPool().query('UPDATE auth_sessions SET revoked_at=NOW() WHERE id=$1', [session.session.id]); appendSetCookie(response, [clearSessionCookie(), clearCsrfCookie()]); return json(response, 200, { success: true }, { 'Cache-Control': 'no-store' }); }
 
-    const info = paymentRouteInfo(request);
-    if (info) {
-      if (info.key.length < 8 || info.key.length > 150) {
-        response.statusCode = 400;
-        response.setHeader('Content-Type', 'application/json; charset=utf-8');
-        response.end(JSON.stringify({ success: false, message: 'A valid Idempotency-Key is required' }));
-        return;
-      }
+    if (path === '/api/v1/auth/forgot-password' && request.method === 'POST') { if (!(await rateLimit(request, 'forgot-password', 5))) return json(response, 429, { success: false, message: 'Too many requests' }); const body = parseJsonBody(request.body); const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : ''; if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email) || email.length > 320) return json(response, 400, { success: false, message: 'Invalid email' }); const merchant = await getPool().query('SELECT id,email FROM merchants WHERE email=$1 LIMIT 1', [email]); if (merchant.rowCount) { const token = randomToken(32); await getPool().query("INSERT INTO auth_tokens(merchant_id,token_hash,purpose,expires_at) VALUES($1,$2,'PASSWORD_RESET',NOW()+INTERVAL '30 minutes')", [merchant.rows[0].id, sha256(token)]); const url = resetUrl(token); if (url) { try { await sendEmail(email, 'Reset your LalaPay password', `<p>Reset your LalaPay password using this link. It expires in 30 minutes.</p><p><a href="${url}">Reset password</a></p>`); } catch {} } } return json(response, 200, { success: true, message: 'If that email exists, a password reset link has been sent.' }, { 'Cache-Control': 'no-store' }); }
 
-      await ensureDatabase();
-      lockClient = await getPool().connect();
-      await lockClient.query('SELECT pg_advisory_lock(hashtextextended($1, 0))', [info.key]);
+    if (path === '/api/v1/auth/reset-password' && request.method === 'POST') { if (!(await rateLimit(request, 'reset-password', 8))) return json(response, 429, { success: false, message: 'Too many requests' }); const body = parseJsonBody(request.body); const token = typeof body.token === 'string' ? body.token.trim() : ''; const password = typeof body.password === 'string' ? body.password : ''; if (!/^[a-f0-9]{64}$/.test(token) || password.length < 8 || password.length > 200) return json(response, 400, { success: false, message: 'Invalid reset request' }); const result = await getPool().query("SELECT id,merchant_id FROM auth_tokens WHERE token_hash=$1 AND purpose='PASSWORD_RESET' AND used_at IS NULL AND expires_at>NOW() LIMIT 1", [sha256(token)]); if (!result.rowCount) return json(response, 400, { success: false, message: 'Reset link is invalid or expired' }); const passwordHash = await createPasswordHash(password); await getPool().query('UPDATE merchants SET password_hash=$1,auth_version=auth_version+1,updated_at=NOW() WHERE id=$2', [passwordHash, result.rows[0].merchant_id]); await getPool().query('UPDATE auth_tokens SET used_at=NOW() WHERE id=$1', [result.rows[0].id]); await revokeAllSessions(result.rows[0].merchant_id); return json(response, 200, { success: true, message: 'Password has been reset. Please log in again.' }, { 'Cache-Control': 'no-store' }); }
 
-      // Enforce idempotency across provider and payment-link boundaries for the same merchant.
-      const existing = await lockClient.query(`
-        SELECT t.id,t.provider,t.provider_payment_id,t.provider_redirect_url,t.status
-        FROM transactions t
-        JOIN payment_links pl ON pl.id=t.payment_link_id
-        WHERE pl.merchant_id=(SELECT merchant_id FROM payment_links WHERE public_id=$1 LIMIT 1)
-          AND t.idempotency_key=$2
-        ORDER BY t.created_at ASC
-        LIMIT 1
-      `, [info.paymentLinkId, info.key]);
+    if (path === '/api/v1/auth/verify-email' && request.method === 'POST') { if (!(await rateLimit(request, 'verify-email', 10))) return json(response, 429, { success: false, message: 'Too many requests' }); const body = parseJsonBody(request.body); const token = typeof body.token === 'string' ? body.token.trim() : ''; if (!/^[a-f0-9]{64}$/.test(token)) return json(response, 400, { success: false, message: 'Invalid verification token' }); const result = await getPool().query("SELECT id,merchant_id FROM auth_tokens WHERE token_hash=$1 AND purpose='EMAIL_VERIFICATION' AND used_at IS NULL AND expires_at>NOW() LIMIT 1", [sha256(token)]); if (!result.rowCount) return json(response, 400, { success: false, message: 'Verification link is invalid or expired' }); await getPool().query('UPDATE merchants SET email_verified_at=COALESCE(email_verified_at,NOW()),updated_at=NOW() WHERE id=$1', [result.rows[0].merchant_id]); await getPool().query('UPDATE auth_tokens SET used_at=NOW() WHERE id=$1', [result.rows[0].id]); return json(response, 200, { success: true, message: 'Email verified successfully' }, { 'Cache-Control': 'no-store' }); }
 
-      if (existing.rowCount) {
-        const tx = existing.rows[0];
-        if (tx.provider !== info.provider) {
-          response.statusCode = 409;
-          response.setHeader('Content-Type', 'application/json; charset=utf-8');
-          response.end(JSON.stringify({ success: false, message: 'Idempotency-Key is already bound to another provider', transactionId: tx.id }));
-          await releaseLock();
-          return;
-        }
-        response.statusCode = 200;
-        response.setHeader('Content-Type', 'application/json; charset=utf-8');
-        response.end(JSON.stringify({ success: true, data: { transactionId: tx.id, paymentId: tx.provider_payment_id, redirectUrl: tx.provider_redirect_url, provider: tx.provider, status: tx.status }, reused: true }));
-        await releaseLock();
-        return;
-      }
+    const sensitiveAuthPath = ['/api/v1/auth/change-password','/api/v1/merchant/profile','/api/v1/merchant/account'];
+    if (sensitiveAuthPath.includes(path)) { const session = await currentSession(request); if (!session) return json(response, 401, { success: false, message: 'Authentication required' }); if ((session as any).invalidCsrf) return json(response, 403, { success: false, message: 'CSRF validation failed' }); const merchantId = session.session.merchant_id;
+      if (path === '/api/v1/merchant/profile' && request.method === 'GET') return json(response, 200, { success: true, data: { id: merchantId, name: session.session.name, email: session.session.email, status: session.session.status, emailVerified: Boolean(session.session.email_verified_at) } });
+      if (path === '/api/v1/merchant/profile' && request.method === 'PATCH') { const body = parseJsonBody(request.body); const name = typeof body.name === 'string' ? body.name.trim() : ''; if (!name || name.length > 150) return json(response, 400, { success: false, message: 'Invalid business name' }); const result = await getPool().query('UPDATE merchants SET name=$1,updated_at=NOW() WHERE id=$2 RETURNING id,name,email,status,email_verified_at,created_at', [name, merchantId]); return json(response, 200, { success: true, data: result.rows[0] }); }
+      if (path === '/api/v1/auth/change-password' && request.method === 'POST') { if (!(await rateLimit(request, 'change-password', 5))) return json(response, 429, { success: false, message: 'Too many requests' }); const body = parseJsonBody(request.body); const current = typeof body.currentPassword === 'string' ? body.currentPassword : ''; const next = typeof body.newPassword === 'string' ? body.newPassword : ''; const result = await getPool().query('SELECT password_hash FROM merchants WHERE id=$1 LIMIT 1', [merchantId]); if (!result.rowCount || !(await verifyPassword(current, result.rows[0].password_hash))) return json(response, 401, { success: false, message: 'Current password is incorrect' }); if (next.length < 8 || next.length > 200) return json(response, 400, { success: false, message: 'New password must be 8-200 characters' }); await getPool().query('UPDATE merchants SET password_hash=$1,auth_version=auth_version+1,updated_at=NOW() WHERE id=$2', [await createPasswordHash(next), merchantId]); await revokeAllSessions(merchantId); const newToken = createAuthToken(merchantId); const csrf = await createSession(merchantId, newToken); appendSetCookie(response, [sessionCookie(newToken), csrfCookie(csrf)]); return json(response, 200, { success: true, message: 'Password changed successfully' }, { 'Cache-Control': 'no-store' }); }
+      if (path === '/api/v1/merchant/account' && request.method === 'DELETE') { await getPool().query("UPDATE merchants SET status='INACTIVE',auth_version=auth_version+1,updated_at=NOW() WHERE id=$1", [merchantId]); await revokeAllSessions(merchantId); appendSetCookie(response, [clearSessionCookie(), clearCsrfCookie()]); return json(response, 200, { success: true, message: 'Merchant account deactivated' }); }
+      return json(response, 405, { success: false, message: 'Method not allowed' }); }
 
-      response.once('finish', releaseLock);
-      response.once('close', releaseLock);
-    }
+    const cookieToken = getCookie(request, SESSION_COOKIE); if (cookieToken) { const session = await currentSession(request); if (session && !(session as any).invalidCsrf) request.headers.authorization = `Bearer ${session.token}`; else if ((session as any)?.invalidCsrf) return json(response, 403, { success: false, message: 'CSRF validation failed' }); else if (path.startsWith('/api/v1/merchant/') || path === '/api/v1/payment-links') return json(response, 401, { success: false, message: 'Authentication required' }); }
 
-    await app.ready();
-    app.server.emit('request', request, response);
-  } catch (error) {
-    await releaseLock();
-    console.error('LalaPay Vercel handler failed:', error instanceof Error ? error.message : 'unknown error');
-    if (!response.headersSent) {
-      response.statusCode = 500;
-      response.setHeader('Content-Type', 'application/json; charset=utf-8');
-      response.end(JSON.stringify({ success: false, message: 'Internal server error' }));
-    }
-  }
+    const info = paymentRouteInfo(request); if (info) { if (info.key.length < 8 || info.key.length > 150) return json(response, 400, { success: false, message: 'A valid Idempotency-Key is required' }); await ensureDatabase(); lockClient = await getPool().connect(); await lockClient.query('SELECT pg_advisory_lock(hashtextextended($1, 0))', [info.key]); const existing = await lockClient.query(`SELECT t.id,t.provider,t.provider_payment_id,t.provider_redirect_url,t.status FROM transactions t JOIN payment_links pl ON pl.id=t.payment_link_id WHERE pl.merchant_id=(SELECT merchant_id FROM payment_links WHERE public_id=$1 LIMIT 1) AND t.idempotency_key=$2 ORDER BY t.created_at ASC LIMIT 1`, [info.paymentLinkId, info.key]); if (existing.rowCount) { const tx = existing.rows[0]; if (tx.provider !== info.provider) { await releaseLock(); return json(response, 409, { success: false, message: 'Idempotency-Key is already bound to another provider', transactionId: tx.id }); } await releaseLock(); return json(response, 200, { success: true, data: { transactionId: tx.id, paymentId: tx.provider_payment_id, redirectUrl: tx.provider_redirect_url, provider: tx.provider, status: tx.status }, reused: true }); } response.once('finish', releaseLock); response.once('close', releaseLock); }
+
+    const originalEnd = response.end.bind(response); response.end = function(body: any, ...args: any[]) { try { const pathNow = String(request.url ?? '').split('?')[0]; if ((pathNow === '/api/v1/auth/login' || pathNow === '/api/v1/auth/register') && request.method === 'POST' && response.statusCode >= 200 && response.statusCode < 300) { const parsed = parseJsonBody(body); const token = parsed?.data?.token; const merchant = parsed?.data?.merchant; if (typeof token === 'string' && merchant?.id) { createSession(String(merchant.id), token).then(async (csrf) => { appendSetCookie(response, [sessionCookie(token, SESSION_MAX_AGE), csrfCookie(csrf, SESSION_MAX_AGE)]); delete parsed.data.token; if (pathNow === '/api/v1/auth/register') { const verificationToken = randomToken(32); await getPool().query("INSERT INTO auth_tokens(merchant_id,token_hash,purpose,expires_at) VALUES($1,$2,'EMAIL_VERIFICATION',NOW()+INTERVAL '24 hours')", [merchant.id, sha256(verificationToken)]); const url = verificationUrl(verificationToken); if (url) { try { await sendEmail(String(merchant.email), 'Verify your LalaPay email', `<p>Verify your LalaPay merchant account.</p><p><a href="${url}">Verify email</a></p>`); } catch {} } } response.setHeader('Cache-Control', 'no-store'); response.setHeader('Content-Type', 'application/json; charset=utf-8'); return response.__lalapayOriginalEnd ? response.__lalapayOriginalEnd(JSON.stringify(parsed), ...args) : undefined; }).catch(() => { response.__lalapayOriginalEnd ? response.__lalapayOriginalEnd(body, ...args) : undefined; }); return; } } } catch {} return response.__lalapayOriginalEnd ? response.__lalapayOriginalEnd(body, ...args) : undefined; };
+    response.__lalapayOriginalEnd = response.end.bind(response); response.end = response.end.bind(response);
+    await app.ready(); app.server.emit('request', request, response);
+  } catch { await releaseLock(); if (!response.headersSent) json(response, 500, { success: false, message: 'Internal server error' }); }
 }
