@@ -4,18 +4,32 @@ let pool: Pool | undefined;
 let initialized = false;
 let initializationPromise: Promise<void> | undefined;
 
+function poolMax() {
+  const configured = Number(process.env.DB_POOL_MAX ?? 5);
+  return Number.isFinite(configured) ? Math.min(10, Math.max(1, Math.floor(configured))) : 5;
+}
+
 export function getPool() {
   if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is not configured');
   if (!pool) {
     pool = new Pool({
       connectionString: process.env.DATABASE_URL,
-      max: Number(process.env.DB_POOL_MAX ?? 5),
+      max: poolMax(),
       idleTimeoutMillis: 10_000,
       connectionTimeoutMillis: 5_000,
+      allowExitOnIdle: true,
       ssl: process.env.DATABASE_SSL === 'false' ? false : { rejectUnauthorized: false },
+    });
+    pool.on('error', (error) => {
+      console.error('LalaPay database pool error:', error.message);
     });
   }
   return pool;
+}
+
+export async function pingDatabase() {
+  await getPool().query('SELECT 1');
+  return true;
 }
 
 export async function ensureDatabase() {
@@ -26,65 +40,40 @@ export async function ensureDatabase() {
     await db.query('CREATE EXTENSION IF NOT EXISTS pgcrypto');
     await db.query(`
       CREATE TABLE IF NOT EXISTS merchants (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        name VARCHAR(150) NOT NULL,
-        email VARCHAR(320) NOT NULL UNIQUE,
-        password_hash TEXT NOT NULL,
-        status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE',
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(), name VARCHAR(150) NOT NULL, email VARCHAR(320) NOT NULL UNIQUE,
+        password_hash TEXT NOT NULL, status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
       CREATE INDEX IF NOT EXISTS merchants_status_idx ON merchants(status);
-
       CREATE TABLE IF NOT EXISTS payment_links (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        public_id VARCHAR(32) NOT NULL UNIQUE,
-        merchant_id UUID NULL REFERENCES merchants(id) ON DELETE SET NULL,
-        title VARCHAR(150) NOT NULL,
-        amount NUMERIC(18,2) NOT NULL CHECK (amount > 0),
-        currency CHAR(3) NOT NULL DEFAULT 'BDT',
-        description TEXT NULL,
-        customer_name VARCHAR(150) NULL,
-        customer_email VARCHAR(320) NULL,
-        customer_phone VARCHAR(30) NULL,
-        expires_at TIMESTAMPTZ NULL,
-        payment_methods JSONB NOT NULL DEFAULT '["bkash","nagad"]'::jsonb,
-        status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE',
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(), public_id VARCHAR(32) NOT NULL UNIQUE, merchant_id UUID NULL REFERENCES merchants(id) ON DELETE SET NULL,
+        title VARCHAR(150) NOT NULL, amount NUMERIC(18,2) NOT NULL CHECK (amount > 0), currency CHAR(3) NOT NULL DEFAULT 'BDT', description TEXT NULL,
+        customer_name VARCHAR(150) NULL, customer_email VARCHAR(320) NULL, customer_phone VARCHAR(30) NULL, expires_at TIMESTAMPTZ NULL,
+        payment_methods JSONB NOT NULL DEFAULT '["bkash","nagad"]'::jsonb, status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
-      CREATE INDEX IF NOT EXISTS payment_links_status_created_idx ON payment_links (status, created_at DESC);
-      CREATE INDEX IF NOT EXISTS payment_links_expires_at_idx ON payment_links (expires_at);
-      CREATE INDEX IF NOT EXISTS payment_links_merchant_created_idx ON payment_links (merchant_id, created_at DESC);
-
+      CREATE INDEX IF NOT EXISTS payment_links_status_created_idx ON payment_links(status, created_at DESC);
+      CREATE INDEX IF NOT EXISTS payment_links_expires_at_idx ON payment_links(expires_at);
+      CREATE INDEX IF NOT EXISTS payment_links_merchant_created_idx ON payment_links(merchant_id, created_at DESC);
       CREATE TABLE IF NOT EXISTS transactions (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        payment_link_id UUID NOT NULL REFERENCES payment_links(id) ON DELETE RESTRICT,
-        provider VARCHAR(20) NOT NULL CHECK (provider IN ('bkash', 'nagad')),
-        amount NUMERIC(18,2) NOT NULL CHECK (amount > 0),
-        currency CHAR(3) NOT NULL DEFAULT 'BDT',
-        status VARCHAR(30) NOT NULL DEFAULT 'INITIATED',
-        provider_payment_id VARCHAR(150) NULL,
-        provider_transaction_id VARCHAR(150) NULL,
-        provider_redirect_url TEXT NULL,
-        idempotency_key VARCHAR(150) NULL,
-        customer_name VARCHAR(150) NULL,
-        customer_email VARCHAR(320) NULL,
-        customer_phone VARCHAR(30) NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        completed_at TIMESTAMPTZ NULL
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(), payment_link_id UUID NOT NULL REFERENCES payment_links(id) ON DELETE RESTRICT,
+        provider VARCHAR(20) NOT NULL CHECK (provider IN ('bkash','nagad')), amount NUMERIC(18,2) NOT NULL CHECK (amount > 0), currency CHAR(3) NOT NULL DEFAULT 'BDT',
+        status VARCHAR(30) NOT NULL DEFAULT 'INITIATED', provider_payment_id VARCHAR(150) NULL, provider_transaction_id VARCHAR(150) NULL, provider_redirect_url TEXT NULL,
+        idempotency_key VARCHAR(150) NULL, customer_name VARCHAR(150) NULL, customer_email VARCHAR(320) NULL, customer_phone VARCHAR(30) NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), completed_at TIMESTAMPTZ NULL
       );
       ALTER TABLE transactions ADD COLUMN IF NOT EXISTS provider_payment_id VARCHAR(150) NULL;
       ALTER TABLE transactions ADD COLUMN IF NOT EXISTS provider_transaction_id VARCHAR(150) NULL;
       ALTER TABLE transactions ADD COLUMN IF NOT EXISTS provider_redirect_url TEXT NULL;
       ALTER TABLE transactions ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(150) NULL;
-      CREATE UNIQUE INDEX IF NOT EXISTS transactions_idempotency_unique_idx ON transactions (payment_link_id, provider, idempotency_key) WHERE idempotency_key IS NOT NULL;
-      CREATE INDEX IF NOT EXISTS transactions_payment_link_idx ON transactions (payment_link_id, created_at DESC);
-      CREATE INDEX IF NOT EXISTS transactions_provider_payment_idx ON transactions (provider, provider_payment_id);
-      CREATE INDEX IF NOT EXISTS transactions_provider_tx_idx ON transactions (provider, provider_transaction_id);
+      CREATE UNIQUE INDEX IF NOT EXISTS transactions_idempotency_unique_idx ON transactions(payment_link_id, provider, idempotency_key) WHERE idempotency_key IS NOT NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS transactions_provider_payment_unique_idx ON transactions(provider, provider_payment_id) WHERE provider_payment_id IS NOT NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS transactions_provider_tx_unique_idx ON transactions(provider, provider_transaction_id) WHERE provider_transaction_id IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS transactions_payment_link_idx ON transactions(payment_link_id, created_at DESC, id);
+      CREATE INDEX IF NOT EXISTS transactions_provider_payment_idx ON transactions(provider, provider_payment_id);
+      CREATE INDEX IF NOT EXISTS transactions_provider_tx_idx ON transactions(provider, provider_transaction_id);
     `);
     initialized = true;
   })();
-  try { await initializationPromise; } finally { initializationPromise = undefined; }
+  try { await initializationPromise; }
+  catch (error) { initialized = false; throw error; }
+  finally { initializationPromise = undefined; }
 }
