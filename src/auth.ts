@@ -38,8 +38,7 @@ export async function verifyPassword(password: string, encoded: string) {
   if (!salt || !expected || !/^[a-f0-9]{32}$/.test(salt)) return false;
   try {
     const actualEncoded = await hashPassword(password, salt);
-    const actualParts = actualEncoded.split('$');
-    const actualValue = actualParts[2];
+    const actualValue = actualEncoded.split('$')[2];
     if (!actualValue) return false;
     const actual = Buffer.from(actualValue, 'base64url');
     const expectedBytes = Buffer.from(expected, 'base64url');
@@ -79,7 +78,7 @@ export function verifyAuthToken(token: string) {
     const data = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as { sub?: string; exp?: number };
     const merchantId = data.sub;
     const expiresAt = data.exp;
-    if (!merchantId || !/^[0-9a-f-]{36}$/i.test(merchantId) || !Number.isSafeInteger(expiresAt) || expiresAt <= Math.floor(Date.now() / 1000)) return null;
+    if (!merchantId || !/^[0-9a-f-]{36}$/i.test(merchantId) || typeof expiresAt !== 'number' || !Number.isSafeInteger(expiresAt) || expiresAt <= Math.floor(Date.now() / 1000)) return null;
     return { merchantId, expiresAt };
   } catch {
     return null;
