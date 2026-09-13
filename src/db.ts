@@ -55,22 +55,52 @@ export async function ensureDatabase() {
       CREATE INDEX IF NOT EXISTS payment_links_merchant_created_idx ON payment_links(merchant_id, created_at DESC);
       CREATE TABLE IF NOT EXISTS transactions (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(), payment_link_id UUID NOT NULL REFERENCES payment_links(id) ON DELETE RESTRICT,
+        merchant_id UUID NULL REFERENCES merchants(id) ON DELETE SET NULL,
         provider VARCHAR(20) NOT NULL CHECK (provider IN ('bkash','nagad')), amount NUMERIC(18,2) NOT NULL CHECK (amount > 0), currency CHAR(3) NOT NULL DEFAULT 'BDT',
         status VARCHAR(30) NOT NULL DEFAULT 'INITIATED', provider_payment_id VARCHAR(150) NULL, provider_transaction_id VARCHAR(150) NULL, provider_redirect_url TEXT NULL,
         idempotency_key VARCHAR(150) NULL, customer_name VARCHAR(150) NULL, customer_email VARCHAR(320) NULL, customer_phone VARCHAR(30) NULL,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), completed_at TIMESTAMPTZ NULL
       );
+      ALTER TABLE transactions ADD COLUMN IF NOT EXISTS merchant_id UUID NULL REFERENCES merchants(id) ON DELETE SET NULL;
       ALTER TABLE transactions ADD COLUMN IF NOT EXISTS provider_payment_id VARCHAR(150) NULL;
       ALTER TABLE transactions ADD COLUMN IF NOT EXISTS provider_transaction_id VARCHAR(150) NULL;
       ALTER TABLE transactions ADD COLUMN IF NOT EXISTS provider_redirect_url TEXT NULL;
       ALTER TABLE transactions ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(150) NULL;
-      CREATE UNIQUE INDEX IF NOT EXISTS transactions_idempotency_unique_idx ON transactions(payment_link_id, provider, idempotency_key) WHERE idempotency_key IS NOT NULL;
-      CREATE UNIQUE INDEX IF NOT EXISTS transactions_provider_payment_unique_idx ON transactions(provider, provider_payment_id) WHERE provider_payment_id IS NOT NULL;
-      CREATE UNIQUE INDEX IF NOT EXISTS transactions_provider_tx_unique_idx ON transactions(provider, provider_transaction_id) WHERE provider_transaction_id IS NOT NULL;
+      UPDATE transactions t SET merchant_id = pl.merchant_id FROM payment_links pl WHERE t.payment_link_id = pl.id AND t.merchant_id IS NULL;
+      CREATE INDEX IF NOT EXISTS transactions_merchant_idx ON transactions(merchant_id, created_at DESC);
       CREATE INDEX IF NOT EXISTS transactions_payment_link_idx ON transactions(payment_link_id, created_at DESC, id);
       CREATE INDEX IF NOT EXISTS transactions_payment_link_status_idx ON transactions(payment_link_id, status, created_at DESC);
       CREATE INDEX IF NOT EXISTS transactions_provider_payment_idx ON transactions(provider, provider_payment_id);
       CREATE INDEX IF NOT EXISTS transactions_provider_tx_idx ON transactions(provider, provider_transaction_id);
+      DROP INDEX IF EXISTS transactions_idempotency_unique_idx;
+      CREATE UNIQUE INDEX IF NOT EXISTS transactions_idempotency_unique_idx ON transactions(merchant_id, idempotency_key) WHERE idempotency_key IS NOT NULL AND merchant_id IS NOT NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS transactions_provider_payment_unique_idx ON transactions(provider, provider_payment_id) WHERE provider_payment_id IS NOT NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS transactions_provider_tx_unique_idx ON transactions(provider, provider_transaction_id) WHERE provider_transaction_id IS NOT NULL;
+
+      CREATE OR REPLACE FUNCTION lalapay_transaction_guard() RETURNS trigger AS $fn$
+      BEGIN
+        IF TG_OP = 'UPDATE' THEN
+          -- Terminal states cannot be changed by stale callbacks or retries.
+          IF OLD.status = 'SUCCESS' AND NEW.status <> 'SUCCESS' THEN RETURN OLD; END IF;
+          IF OLD.status = 'FAILED' AND NEW.status NOT IN ('FAILED') THEN RETURN OLD; END IF;
+          IF OLD.status = 'SUCCESS' AND NEW.provider_transaction_id IS DISTINCT FROM OLD.provider_transaction_id THEN RETURN OLD; END IF;
+          IF OLD.status = 'SUCCESS' AND NEW.completed_at IS DISTINCT FROM OLD.completed_at THEN NEW.completed_at := OLD.completed_at; END IF;
+        END IF;
+
+        -- Provider identifiers are immutable once assigned.
+        IF OLD.provider_payment_id IS NOT NULL AND NEW.provider_payment_id IS DISTINCT FROM OLD.provider_payment_id THEN RETURN OLD; END IF;
+        IF OLD.provider_transaction_id IS NOT NULL AND NEW.provider_transaction_id IS DISTINCT FROM OLD.provider_transaction_id THEN RETURN OLD; END IF;
+
+        NEW.updated_at := NOW();
+        IF NEW.status = 'SUCCESS' THEN
+          NEW.completed_at := COALESCE(OLD.completed_at, NEW.completed_at, NOW());
+        END IF;
+        RETURN NEW;
+      END;
+      $fn$ LANGUAGE plpgsql;
+
+      DROP TRIGGER IF EXISTS transactions_guard_trigger ON transactions;
+      CREATE TRIGGER transactions_guard_trigger BEFORE UPDATE ON transactions FOR EACH ROW EXECUTE FUNCTION lalapay_transaction_guard();
     `);
     initialized = true;
   })();
