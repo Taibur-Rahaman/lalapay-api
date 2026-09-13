@@ -1,10 +1,5 @@
 {
   "version": 2,
-  "functions": {
-    "api/index.ts": {
-      "runtime": "nodejs24.x"
-    }
-  },
   "rewrites": [
     { "source": "/(.*)", "destination": "/api/index.ts" }
   ]
