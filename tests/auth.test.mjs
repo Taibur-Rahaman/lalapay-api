@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 
 process.env.JWT_SECRET = 'lalapay-test-secret-0123456789-abcdefghijklmnopqrstuvwxyz';
 
-const { createAuthToken, verifyAuthToken, getBearerToken, createPasswordHash, verifyPassword } = await import('../src/auth.js');
+const { createAuthToken, verifyAuthToken, getBearerToken, createPasswordHash, verifyPassword } = await import('../dist/auth.js');
 
 const merchantId = '123e4567-e89b-12d3-a456-426614174000';
 
