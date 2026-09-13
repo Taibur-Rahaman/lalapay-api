@@ -3,8 +3,5 @@
   "rewrites": [
     { "source": "/api/reconcile", "destination": "/api/reconcile.ts" },
     { "source": "/(.*)", "destination": "/api/index.ts" }
-  ],
-  "crons": [
-    { "path": "/api/reconcile", "schedule": "*/5 * * * *" }
   ]
 }
