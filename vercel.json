@@ -1,5 +1,11 @@
 {
   "version": 2,
+  "buildCommand": "npm run build",
+  "functions": {
+    "api/index.ts": {
+      "runtime": "nodejs24.x"
+    }
+  },
   "rewrites": [
     { "source": "/(.*)", "destination": "/api/index.ts" }
   ]
