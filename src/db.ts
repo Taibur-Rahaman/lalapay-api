@@ -54,6 +54,7 @@ export async function ensureDatabase() {
         status VARCHAR(30) NOT NULL DEFAULT 'INITIATED',
         provider_payment_id VARCHAR(150) NULL,
         provider_transaction_id VARCHAR(150) NULL,
+        provider_redirect_url TEXT NULL,
         idempotency_key VARCHAR(150) NULL,
         customer_name VARCHAR(150) NULL,
         customer_email VARCHAR(320) NULL,
@@ -64,6 +65,7 @@ export async function ensureDatabase() {
       );
       ALTER TABLE transactions ADD COLUMN IF NOT EXISTS provider_payment_id VARCHAR(150) NULL;
       ALTER TABLE transactions ADD COLUMN IF NOT EXISTS provider_transaction_id VARCHAR(150) NULL;
+      ALTER TABLE transactions ADD COLUMN IF NOT EXISTS provider_redirect_url TEXT NULL;
       ALTER TABLE transactions ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(150) NULL;
       CREATE UNIQUE INDEX IF NOT EXISTS transactions_idempotency_unique_idx ON transactions (payment_link_id, provider, idempotency_key) WHERE idempotency_key IS NOT NULL;
       CREATE INDEX IF NOT EXISTS transactions_payment_link_idx ON transactions (payment_link_id, created_at DESC);
