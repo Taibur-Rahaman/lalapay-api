@@ -14,6 +14,7 @@ const credentialsSchema = z.object({ name: z.string().trim().min(1).max(150), em
 const loginSchema = z.object({ email: z.string().email().max(320), password: z.string().min(1).max(200) });
 const idSchema = z.object({ id: z.string().trim().min(8).max(32) });
 const idempotencySchema = z.string().trim().min(8).max(150);
+const statusSchema = z.object({ status: z.enum(['ACTIVE', 'INACTIVE']) });
 function publicId() { return randomBytes(9).toString('base64url'); }
 function isExpired(row: any) { return Boolean(row.expires_at && new Date(row.expires_at).getTime() <= Date.now()); }
 function serializeLink(row: any) { return { id: row.public_id, title: row.title, amount: Number(row.amount), currency: row.currency, description: row.description, customerName: row.customer_name, customerEmail: row.customer_email, customerPhone: row.customer_phone, expiresAt: row.expires_at, paymentMethods: row.payment_methods, status: row.status === 'ACTIVE' && isExpired(row) ? 'EXPIRED' : row.status, createdAt: row.created_at, updatedAt: row.updated_at }; }
@@ -27,14 +28,20 @@ export function buildApp() {
 
   app.addHook('preHandler', async (request, reply) => {
     const path = request.url.split('?')[0];
-    const protectedRoute = (request.method === 'POST' && path === '/api/v1/payment-links') || (request.method === 'GET' && path === '/api/v1/payment-links') || (request.method === 'GET' && path === '/api/v1/merchant/transactions');
+    const protectedRoute =
+      (request.method === 'POST' && path === '/api/v1/payment-links') ||
+      (request.method === 'GET' && path === '/api/v1/payment-links') ||
+      (request.method === 'GET' && path === '/api/v1/merchant/transactions') ||
+      (request.method === 'GET' && path === '/api/v1/merchant/stats') ||
+      (request.method === 'GET' && /^\/api\/v1\/merchant\/payment-links\/[^/]+$/.test(path)) ||
+      (request.method === 'PATCH' && /^\/api\/v1\/merchant\/payment-links\/[^/]+\/status$/.test(path));
     if (!protectedRoute) return;
     const auth = authMerchant(request);
     if (!auth) return reply.code(401).send({ success: false, message: 'Authentication required' });
     (request as any).merchantId = auth.merchantId;
   });
 
-  app.get('/health', async () => ({ status: 'ok', service: 'lalapay-api', version: '0.7.0', database: Boolean(process.env.DATABASE_URL), auth: Boolean(process.env.JWT_SECRET && process.env.JWT_SECRET.length >= 32), bkash: Boolean(process.env.BKASH_BASE_URL && process.env.BKASH_APP_KEY), nagad: Boolean(process.env.NAGAD_BASE_URL && process.env.NAGAD_MERCHANT_ID && process.env.NAGAD_MERCHANT_PRIVATE_KEY && process.env.NAGAD_PG_PUBLIC_KEY) }));
+  app.get('/health', async () => ({ status: 'ok', service: 'lalapay-api', version: '0.8.0', database: Boolean(process.env.DATABASE_URL), auth: Boolean(process.env.JWT_SECRET && process.env.JWT_SECRET.length >= 32), bkash: Boolean(process.env.BKASH_BASE_URL && process.env.BKASH_APP_KEY), nagad: Boolean(process.env.NAGAD_BASE_URL && process.env.NAGAD_MERCHANT_ID && process.env.NAGAD_MERCHANT_PRIVATE_KEY && process.env.NAGAD_PG_PUBLIC_KEY) }));
 
   app.post('/api/v1/auth/register', async (request, reply) => {
     const parsed = credentialsSchema.safeParse(request.body); if (!parsed.success) return reply.code(400).send({ success: false, message: 'Invalid registration data', errors: parsed.error.flatten() });
@@ -69,6 +76,23 @@ export function buildApp() {
   app.get('/api/v1/payment-links', async (request, reply) => {
     const query = z.object({ limit: z.coerce.number().int().min(1).max(100).default(25), offset: z.coerce.number().int().min(0).max(10000).default(0) }).safeParse(request.query); if (!query.success) return reply.code(400).send({ success: false, message: 'Invalid pagination' });
     try { await ensureDatabase(); const result = await getPool().query('SELECT * FROM payment_links WHERE merchant_id=$1 ORDER BY created_at DESC LIMIT $2 OFFSET $3', [(request as any).merchantId, query.data.limit, query.data.offset]); return reply.send({ success: true, data: result.rows.map(serializeLink), pagination: { limit: query.data.limit, offset: query.data.offset, count: result.rowCount } }); }
+    catch (error) { request.log.error(error); return reply.code(503).send({ success: false, message: 'Database is unavailable' }); }
+  });
+
+  app.get('/api/v1/merchant/payment-links/:id', async (request, reply) => {
+    const params = idSchema.safeParse(request.params); if (!params.success) return reply.code(400).send({ success: false, message: 'Invalid payment link id' });
+    try { await ensureDatabase(); const result = await getPool().query('SELECT * FROM payment_links WHERE public_id=$1 AND merchant_id=$2 LIMIT 1', [params.data.id, (request as any).merchantId]); if (!result.rowCount) return reply.code(404).send({ success: false, message: 'Payment link not found' }); const link = result.rows[0]; const tx = await getPool().query('SELECT id,provider,amount,currency,status,provider_payment_id,provider_transaction_id,customer_name,customer_email,customer_phone,created_at,updated_at,completed_at FROM transactions WHERE payment_link_id=$1 ORDER BY created_at DESC LIMIT 100', [link.id]); return reply.send({ success: true, data: { link: serializeLink(link), transactions: tx.rows } }); }
+    catch (error) { request.log.error(error); return reply.code(503).send({ success: false, message: 'Database is unavailable' }); }
+  });
+
+  app.patch('/api/v1/merchant/payment-links/:id/status', async (request, reply) => {
+    const params = idSchema.safeParse(request.params); const body = statusSchema.safeParse(request.body); if (!params.success || !body.success) return reply.code(400).send({ success: false, message: 'Invalid payment link status request' });
+    try { await ensureDatabase(); const result = await getPool().query('UPDATE payment_links SET status=$1,updated_at=NOW() WHERE public_id=$2 AND merchant_id=$3 RETURNING *', [body.data.status, params.data.id, (request as any).merchantId]); if (!result.rowCount) return reply.code(404).send({ success: false, message: 'Payment link not found' }); return reply.send({ success: true, data: serializeLink(result.rows[0]) }); }
+    catch (error) { request.log.error(error); return reply.code(503).send({ success: false, message: 'Database is unavailable' }); }
+  });
+
+  app.get('/api/v1/merchant/stats', async (request, reply) => {
+    try { await ensureDatabase(); const merchantId = (request as any).merchantId; const result = await getPool().query(`SELECT COUNT(*)::int AS total_transactions, COUNT(*) FILTER (WHERE t.status='SUCCESS')::int AS successful_transactions, COUNT(*) FILTER (WHERE t.status='PENDING')::int AS pending_transactions, COUNT(*) FILTER (WHERE t.status='FAILED')::int AS failed_transactions, COALESCE(SUM(t.amount) FILTER (WHERE t.status='SUCCESS'),0)::numeric AS total_revenue, COUNT(DISTINCT t.payment_link_id)::int AS links_with_transactions FROM transactions t JOIN payment_links pl ON pl.id=t.payment_link_id WHERE pl.merchant_id=$1`, [merchantId]); const links = await getPool().query("SELECT COUNT(*)::int AS total_links, COUNT(*) FILTER (WHERE status='ACTIVE' AND (expires_at IS NULL OR expires_at>NOW()))::int AS active_links, COUNT(*) FILTER (WHERE status='INACTIVE')::int AS inactive_links FROM payment_links WHERE merchant_id=$1", [merchantId]); return reply.send({ success: true, data: { ...result.rows[0], ...links.rows[0] } }); }
     catch (error) { request.log.error(error); return reply.code(503).send({ success: false, message: 'Database is unavailable' }); }
   });
 
