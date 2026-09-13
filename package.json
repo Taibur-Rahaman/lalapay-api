@@ -1,6 +1,6 @@
 {
   "name": "lalapay-api",
-  "version": "0.4.0",
+  "version": "0.6.0",
   "private": true,
   "description": "LalaPay payment API for bKash and Nagad.",
   "type": "module",
@@ -17,7 +17,6 @@
     "@fastify/rate-limit": "latest",
     "fastify": "latest",
     "pg": "latest",
-    "fastify-plugin": "latest",
     "zod": "latest"
   },
   "devDependencies": {
