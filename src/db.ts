@@ -3,113 +3,34 @@ import { Pool } from 'pg';
 let pool: Pool | undefined;
 let initialized = false;
 let initializationPromise: Promise<void> | undefined;
-
-function poolMax() {
-  const configured = Number(process.env.DB_POOL_MAX ?? 5);
-  return Number.isFinite(configured) ? Math.min(10, Math.max(1, Math.floor(configured))) : 5;
-}
-
-export function getPool() {
-  if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is not configured');
-  if (!pool) {
-    pool = new Pool({
-      connectionString: process.env.DATABASE_URL,
-      max: poolMax(),
-      idleTimeoutMillis: 10_000,
-      connectionTimeoutMillis: 5_000,
-      allowExitOnIdle: true,
-      ssl: process.env.DATABASE_SSL === 'false' ? false : { rejectUnauthorized: false },
-    });
-    pool.on('error', (error) => console.error('LalaPay database pool error:', error.message));
-  }
-  return pool;
-}
-
-export async function pingDatabase() {
-  await getPool().query('SELECT 1');
-  return true;
-}
-
+function poolMax() { const configured = Number(process.env.DB_POOL_MAX ?? 5); return Number.isFinite(configured) ? Math.min(10, Math.max(1, Math.floor(configured))) : 5; }
+export function getPool() { if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is not configured'); if (!pool) { pool = new Pool({ connectionString: process.env.DATABASE_URL, max: poolMax(), idleTimeoutMillis: 10_000, connectionTimeoutMillis: 5_000, allowExitOnIdle: true, ssl: process.env.DATABASE_SSL === 'false' ? false : { rejectUnauthorized: false } }); pool.on('error', (error) => console.error('LalaPay database pool error:', error.message)); } return pool; }
+export async function pingDatabase() { await getPool().query('SELECT 1'); return true; }
 export async function ensureDatabase() {
-  if (initialized) return;
-  if (initializationPromise) return initializationPromise;
+  if (initialized) return; if (initializationPromise) return initializationPromise;
   initializationPromise = (async () => {
-    const db = getPool();
-    await db.query('CREATE EXTENSION IF NOT EXISTS pgcrypto');
+    const db = getPool(); await db.query('CREATE EXTENSION IF NOT EXISTS pgcrypto');
     await db.query(`
-      CREATE TABLE IF NOT EXISTS merchants (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(), name VARCHAR(150) NOT NULL, email VARCHAR(320) NOT NULL UNIQUE,
-        password_hash TEXT NOT NULL, status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-      ALTER TABLE merchants ADD COLUMN IF NOT EXISTS email_verified_at TIMESTAMPTZ NULL;
-      ALTER TABLE merchants ADD COLUMN IF NOT EXISTS auth_version INTEGER NOT NULL DEFAULT 1;
-      CREATE INDEX IF NOT EXISTS merchants_status_idx ON merchants(status);
-      CREATE TABLE IF NOT EXISTS auth_sessions (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(), merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
-        token_hash CHAR(64) NOT NULL UNIQUE, csrf_token CHAR(64) NOT NULL,
-        expires_at TIMESTAMPTZ NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), revoked_at TIMESTAMPTZ NULL
-      );
-      CREATE INDEX IF NOT EXISTS auth_sessions_merchant_idx ON auth_sessions(merchant_id, expires_at DESC);
-      CREATE INDEX IF NOT EXISTS auth_sessions_active_idx ON auth_sessions(token_hash) WHERE revoked_at IS NULL;
-      CREATE TABLE IF NOT EXISTS auth_tokens (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(), merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
-        token_hash CHAR(64) NOT NULL UNIQUE, purpose VARCHAR(30) NOT NULL CHECK (purpose IN ('PASSWORD_RESET','EMAIL_VERIFICATION')),
-        expires_at TIMESTAMPTZ NOT NULL, used_at TIMESTAMPTZ NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-      CREATE INDEX IF NOT EXISTS auth_tokens_lookup_idx ON auth_tokens(token_hash, purpose, expires_at) WHERE used_at IS NULL;
-      CREATE TABLE IF NOT EXISTS payment_links (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(), public_id VARCHAR(32) NOT NULL UNIQUE, merchant_id UUID NULL REFERENCES merchants(id) ON DELETE SET NULL,
-        title VARCHAR(150) NOT NULL, amount NUMERIC(18,2) NOT NULL CHECK (amount > 0), currency CHAR(3) NOT NULL DEFAULT 'BDT', description TEXT NULL,
-        customer_name VARCHAR(150) NULL, customer_email VARCHAR(320) NULL, customer_phone VARCHAR(30) NULL, expires_at TIMESTAMPTZ NULL,
-        payment_methods JSONB NOT NULL DEFAULT '["bkash","nagad"]'::jsonb, status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-      CREATE INDEX IF NOT EXISTS payment_links_status_created_idx ON payment_links(status, created_at DESC);
-      CREATE INDEX IF NOT EXISTS payment_links_expires_at_idx ON payment_links(expires_at);
-      CREATE INDEX IF NOT EXISTS payment_links_merchant_created_idx ON payment_links(merchant_id, created_at DESC);
-      CREATE TABLE IF NOT EXISTS transactions (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(), payment_link_id UUID NOT NULL REFERENCES payment_links(id) ON DELETE RESTRICT,
-        merchant_id UUID NULL REFERENCES merchants(id) ON DELETE SET NULL,
-        provider VARCHAR(20) NOT NULL CHECK (provider IN ('bkash','nagad')), amount NUMERIC(18,2) NOT NULL CHECK (amount > 0), currency CHAR(3) NOT NULL DEFAULT 'BDT',
-        status VARCHAR(30) NOT NULL DEFAULT 'INITIATED', provider_payment_id VARCHAR(150) NULL, provider_transaction_id VARCHAR(150) NULL, provider_redirect_url TEXT NULL,
-        idempotency_key VARCHAR(150) NULL, customer_name VARCHAR(150) NULL, customer_email VARCHAR(320) NULL, customer_phone VARCHAR(30) NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), completed_at TIMESTAMPTZ NULL
-      );
-      ALTER TABLE transactions ADD COLUMN IF NOT EXISTS merchant_id UUID NULL REFERENCES merchants(id) ON DELETE SET NULL;
-      ALTER TABLE transactions ADD COLUMN IF NOT EXISTS provider_payment_id VARCHAR(150) NULL;
-      ALTER TABLE transactions ADD COLUMN IF NOT EXISTS provider_transaction_id VARCHAR(150) NULL;
-      ALTER TABLE transactions ADD COLUMN IF NOT EXISTS provider_redirect_url TEXT NULL;
-      ALTER TABLE transactions ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(150) NULL;
-      UPDATE transactions t SET merchant_id = pl.merchant_id FROM payment_links pl WHERE t.payment_link_id = pl.id AND t.merchant_id IS NULL;
-      CREATE INDEX IF NOT EXISTS transactions_merchant_idx ON transactions(merchant_id, created_at DESC);
-      CREATE INDEX IF NOT EXISTS transactions_payment_link_idx ON transactions(payment_link_id, created_at DESC, id);
-      CREATE INDEX IF NOT EXISTS transactions_payment_link_status_idx ON transactions(payment_link_id, status, created_at DESC);
-      CREATE INDEX IF NOT EXISTS transactions_provider_payment_idx ON transactions(provider, provider_payment_id);
-      CREATE INDEX IF NOT EXISTS transactions_provider_tx_idx ON transactions(provider, provider_transaction_id);
-      DROP INDEX IF EXISTS transactions_idempotency_unique_idx;
-      CREATE UNIQUE INDEX IF NOT EXISTS transactions_idempotency_unique_idx ON transactions(merchant_id, idempotency_key) WHERE idempotency_key IS NOT NULL AND merchant_id IS NOT NULL;
-      CREATE UNIQUE INDEX IF NOT EXISTS transactions_provider_payment_unique_idx ON transactions(provider, provider_payment_id) WHERE provider_payment_id IS NOT NULL;
-      CREATE UNIQUE INDEX IF NOT EXISTS transactions_provider_tx_unique_idx ON transactions(provider, provider_transaction_id) WHERE provider_transaction_id IS NOT NULL;
-      CREATE OR REPLACE FUNCTION lalapay_transaction_guard() RETURNS trigger AS $fn$
-      BEGIN
-        IF TG_OP = 'INSERT' THEN
-          IF NEW.merchant_id IS NULL THEN SELECT merchant_id INTO NEW.merchant_id FROM payment_links WHERE id = NEW.payment_link_id; END IF;
-          RETURN NEW;
-        END IF;
-        IF OLD.status = 'SUCCESS' AND NEW.status <> 'SUCCESS' THEN RETURN OLD; END IF;
-        IF OLD.provider_payment_id IS NOT NULL AND NEW.provider_payment_id IS DISTINCT FROM OLD.provider_payment_id THEN RETURN OLD; END IF;
-        IF OLD.provider_transaction_id IS NOT NULL AND NEW.provider_transaction_id IS DISTINCT FROM OLD.provider_transaction_id THEN RETURN OLD; END IF;
-        NEW.updated_at := NOW();
-        IF NEW.status = 'SUCCESS' THEN NEW.completed_at := COALESCE(OLD.completed_at, NEW.completed_at, NOW()); END IF;
-        IF OLD.status = 'SUCCESS' THEN NEW.completed_at := OLD.completed_at; END IF;
-        RETURN NEW;
-      END;
-      $fn$ LANGUAGE plpgsql;
-      DROP TRIGGER IF EXISTS transactions_guard_trigger ON transactions;
-      CREATE TRIGGER transactions_guard_trigger BEFORE INSERT OR UPDATE ON transactions FOR EACH ROW EXECUTE FUNCTION lalapay_transaction_guard();
-    `);
-    initialized = true;
+      CREATE TABLE IF NOT EXISTS merchants (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), name VARCHAR(150) NOT NULL, email VARCHAR(320) NOT NULL UNIQUE, password_hash TEXT NOT NULL, status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
+      ALTER TABLE merchants ADD COLUMN IF NOT EXISTS email_verified_at TIMESTAMPTZ NULL; ALTER TABLE merchants ADD COLUMN IF NOT EXISTS auth_version INTEGER NOT NULL DEFAULT 1; CREATE INDEX IF NOT EXISTS merchants_status_idx ON merchants(status);
+      CREATE TABLE IF NOT EXISTS auth_sessions (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE, token_hash CHAR(64) NOT NULL UNIQUE, csrf_token CHAR(64) NOT NULL, expires_at TIMESTAMPTZ NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), revoked_at TIMESTAMPTZ NULL); CREATE INDEX IF NOT EXISTS auth_sessions_merchant_idx ON auth_sessions(merchant_id, expires_at DESC); CREATE INDEX IF NOT EXISTS auth_sessions_active_idx ON auth_sessions(token_hash) WHERE revoked_at IS NULL;
+      CREATE TABLE IF NOT EXISTS auth_tokens (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE, token_hash CHAR(64) NOT NULL UNIQUE, purpose VARCHAR(30) NOT NULL CHECK (purpose IN ('PASSWORD_RESET','EMAIL_VERIFICATION')), expires_at TIMESTAMPTZ NOT NULL, used_at TIMESTAMPTZ NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()); CREATE INDEX IF NOT EXISTS auth_tokens_lookup_idx ON auth_tokens(token_hash, purpose, expires_at) WHERE used_at IS NULL;
+      CREATE TABLE IF NOT EXISTS payment_links (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), public_id VARCHAR(32) NOT NULL UNIQUE, merchant_id UUID NULL REFERENCES merchants(id) ON DELETE SET NULL, title VARCHAR(150) NOT NULL, amount NUMERIC(18,2) NOT NULL CHECK (amount > 0), currency CHAR(3) NOT NULL DEFAULT 'BDT', description TEXT NULL, customer_name VARCHAR(150) NULL, customer_email VARCHAR(320) NULL, customer_phone VARCHAR(30) NULL, expires_at TIMESTAMPTZ NULL, payment_methods JSONB NOT NULL DEFAULT '["bkash","nagad"]'::jsonb, status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
+      CREATE INDEX IF NOT EXISTS payment_links_status_created_idx ON payment_links(status, created_at DESC); CREATE INDEX IF NOT EXISTS payment_links_expires_at_idx ON payment_links(expires_at); CREATE INDEX IF NOT EXISTS payment_links_merchant_created_idx ON payment_links(merchant_id, created_at DESC);
+      CREATE TABLE IF NOT EXISTS transactions (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), payment_link_id UUID NOT NULL REFERENCES payment_links(id) ON DELETE RESTRICT, merchant_id UUID NULL REFERENCES merchants(id) ON DELETE SET NULL, provider VARCHAR(20) NOT NULL CHECK (provider IN ('bkash','nagad')), amount NUMERIC(18,2) NOT NULL CHECK (amount > 0), currency CHAR(3) NOT NULL DEFAULT 'BDT', status VARCHAR(30) NOT NULL DEFAULT 'INITIATED', provider_payment_id VARCHAR(150) NULL, provider_transaction_id VARCHAR(150) NULL, provider_redirect_url TEXT NULL, idempotency_key VARCHAR(150) NULL, customer_name VARCHAR(150) NULL, customer_email VARCHAR(320) NULL, customer_phone VARCHAR(30) NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), completed_at TIMESTAMPTZ NULL);
+      ALTER TABLE transactions ADD COLUMN IF NOT EXISTS merchant_id UUID NULL REFERENCES merchants(id) ON DELETE SET NULL; ALTER TABLE transactions ADD COLUMN IF NOT EXISTS provider_payment_id VARCHAR(150) NULL; ALTER TABLE transactions ADD COLUMN IF NOT EXISTS provider_transaction_id VARCHAR(150) NULL; ALTER TABLE transactions ADD COLUMN IF NOT EXISTS provider_redirect_url TEXT NULL; ALTER TABLE transactions ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(150) NULL; UPDATE transactions t SET merchant_id = pl.merchant_id FROM payment_links pl WHERE t.payment_link_id = pl.id AND t.merchant_id IS NULL;
+      CREATE INDEX IF NOT EXISTS transactions_merchant_idx ON transactions(merchant_id, created_at DESC); CREATE INDEX IF NOT EXISTS transactions_payment_link_idx ON transactions(payment_link_id, created_at DESC, id); CREATE INDEX IF NOT EXISTS transactions_payment_link_status_idx ON transactions(payment_link_id, status, created_at DESC); CREATE INDEX IF NOT EXISTS transactions_provider_payment_idx ON transactions(provider, provider_payment_id); CREATE INDEX IF NOT EXISTS transactions_provider_tx_idx ON transactions(provider, provider_transaction_id); CREATE INDEX IF NOT EXISTS transactions_pending_reconciliation_idx ON transactions(status, updated_at) WHERE status IN ('INITIATED','PENDING');
+      DROP INDEX IF EXISTS transactions_idempotency_unique_idx; CREATE UNIQUE INDEX IF NOT EXISTS transactions_idempotency_unique_idx ON transactions(merchant_id, idempotency_key) WHERE idempotency_key IS NOT NULL AND merchant_id IS NOT NULL; CREATE UNIQUE INDEX IF NOT EXISTS transactions_provider_payment_unique_idx ON transactions(provider, provider_payment_id) WHERE provider_payment_id IS NOT NULL; CREATE UNIQUE INDEX IF NOT EXISTS transactions_provider_tx_unique_idx ON transactions(provider, provider_transaction_id) WHERE provider_transaction_id IS NOT NULL;
+      CREATE TABLE IF NOT EXISTS transaction_audit_log (id BIGSERIAL PRIMARY KEY, transaction_id UUID NOT NULL REFERENCES transactions(id) ON DELETE CASCADE, old_status VARCHAR(30), new_status VARCHAR(30) NOT NULL, provider VARCHAR(20) NOT NULL, provider_payment_id VARCHAR(150), provider_transaction_id VARCHAR(150), amount NUMERIC(18,2), currency CHAR(3), reason VARCHAR(120) NOT NULL DEFAULT 'transaction_update', request_id VARCHAR(100), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
+      CREATE INDEX IF NOT EXISTS transaction_audit_tx_idx ON transaction_audit_log(transaction_id, created_at DESC); CREATE INDEX IF NOT EXISTS transaction_audit_created_idx ON transaction_audit_log(created_at DESC);
+      CREATE TABLE IF NOT EXISTS reconciliation_runs (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), finished_at TIMESTAMPTZ NULL, checked_count INTEGER NOT NULL DEFAULT 0, recovered_count INTEGER NOT NULL DEFAULT 0, failed_count INTEGER NOT NULL DEFAULT 0, error_count INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE IF NOT EXISTS reconciliation_mismatches (id BIGSERIAL PRIMARY KEY, run_id UUID NOT NULL REFERENCES reconciliation_runs(id) ON DELETE CASCADE, transaction_id UUID NOT NULL REFERENCES transactions(id) ON DELETE CASCADE, provider VARCHAR(20) NOT NULL, local_status VARCHAR(30) NOT NULL, provider_status VARCHAR(80), mismatch_type VARCHAR(80) NOT NULL, details JSONB NOT NULL DEFAULT '{}'::jsonb, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
+      CREATE INDEX IF NOT EXISTS reconciliation_mismatch_tx_idx ON reconciliation_mismatches(transaction_id, created_at DESC);
+      CREATE OR REPLACE FUNCTION lalapay_transaction_audit() RETURNS trigger AS $fn$ BEGIN IF TG_OP='INSERT' THEN INSERT INTO transaction_audit_log(transaction_id,new_status,provider,provider_payment_id,provider_transaction_id,amount,currency,reason,request_id) VALUES(NEW.id,NEW.status,NEW.provider,NEW.provider_payment_id,NEW.provider_transaction_id,NEW.amount,NEW.currency,'transaction_created',NULL); RETURN NEW; END IF; IF OLD.status IS DISTINCT FROM NEW.status OR OLD.provider_transaction_id IS DISTINCT FROM NEW.provider_transaction_id OR OLD.provider_payment_id IS DISTINCT FROM NEW.provider_payment_id THEN INSERT INTO transaction_audit_log(transaction_id,old_status,new_status,provider,provider_payment_id,provider_transaction_id,amount,currency,reason,request_id) VALUES(NEW.id,OLD.status,NEW.status,NEW.provider,NEW.provider_payment_id,NEW.provider_transaction_id,NEW.amount,NEW.currency,CASE WHEN OLD.status IS DISTINCT FROM NEW.status THEN 'status_change' ELSE 'provider_reference_update' END,NULL); END IF; RETURN NEW; END; $fn$ LANGUAGE plpgsql;
+      DROP TRIGGER IF EXISTS transactions_audit_trigger ON transactions; CREATE TRIGGER transactions_audit_trigger AFTER INSERT OR UPDATE ON transactions FOR EACH ROW EXECUTE FUNCTION lalapay_transaction_audit();
+      CREATE OR REPLACE FUNCTION lalapay_transaction_guard() RETURNS trigger AS $fn$ BEGIN IF TG_OP='INSERT' THEN IF NEW.merchant_id IS NULL THEN SELECT merchant_id INTO NEW.merchant_id FROM payment_links WHERE id=NEW.payment_link_id; END IF; RETURN NEW; END IF; IF OLD.status='SUCCESS' AND NEW.status<>'SUCCESS' THEN RETURN OLD; END IF; IF OLD.provider_payment_id IS NOT NULL AND NEW.provider_payment_id IS DISTINCT FROM OLD.provider_payment_id THEN RETURN OLD; END IF; IF OLD.provider_transaction_id IS NOT NULL AND NEW.provider_transaction_id IS DISTINCT FROM OLD.provider_transaction_id THEN RETURN OLD; END IF; NEW.updated_at:=NOW(); IF NEW.status='SUCCESS' THEN NEW.completed_at:=COALESCE(OLD.completed_at,NEW.completed_at,NOW()); END IF; IF OLD.status='SUCCESS' THEN NEW.completed_at:=OLD.completed_at; END IF; RETURN NEW; END; $fn$ LANGUAGE plpgsql;
+      DROP TRIGGER IF EXISTS transactions_guard_trigger ON transactions; CREATE TRIGGER transactions_guard_trigger BEFORE INSERT OR UPDATE ON transactions FOR EACH ROW EXECUTE FUNCTION lalapay_transaction_guard();
+    `); initialized = true;
   })();
-  try { await initializationPromise; }
-  catch (error) { initialized = false; throw error; }
-  finally { initializationPromise = undefined; }
+  try { await initializationPromise; } catch (error) { initialized=false; throw error; } finally { initializationPromise=undefined; }
 }
