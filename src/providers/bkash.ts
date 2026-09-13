@@ -10,13 +10,26 @@ function config(): BkashConfig {
   return { baseUrl: process.env.BKASH_BASE_URL!.replace(/\/$/, ''), appKey: process.env.BKASH_APP_KEY!, appSecret: process.env.BKASH_APP_SECRET!, username: process.env.BKASH_USERNAME!, password: process.env.BKASH_PASSWORD!, callbackUrl: process.env.BKASH_CALLBACK_URL! };
 }
 
+const RETRYABLE = new Set([408, 425, 429, 500, 502, 503, 504]);
 async function request<T>(url: string, init: RequestInit): Promise<T> {
-  const response = await fetch(url, { ...init, signal: AbortSignal.timeout(15_000) });
-  const text = await response.text();
-  let body: unknown;
-  try { body = text ? JSON.parse(text) : {}; } catch { body = { message: text }; }
-  if (!response.ok) throw new Error(`bKash HTTP ${response.status}: ${text.slice(0, 500)}`);
-  return body as T;
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const response = await fetch(url, { ...init, signal: AbortSignal.timeout(15_000) });
+      const text = await response.text();
+      let body: unknown;
+      try { body = text ? JSON.parse(text) : {}; } catch { body = { message: text }; }
+      if (response.ok) return body as T;
+      const error = new Error(`bKash HTTP ${response.status}: ${text.slice(0, 500)}`);
+      if (!RETRYABLE.has(response.status) || attempt === 2) throw error;
+      lastError = error;
+    } catch (error) {
+      lastError = error;
+      if (attempt === 2) throw error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250 * 2 ** attempt));
+  }
+  throw lastError instanceof Error ? lastError : new Error('bKash request failed');
 }
 
 async function fetchToken(): Promise<string> {
