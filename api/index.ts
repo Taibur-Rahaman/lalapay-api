@@ -1,5 +1,5 @@
-import { app } from '../dist/server.js';
-import { pingDatabase } from '../dist/db.js';
+import { app } from '../src/server.js';
+import { pingDatabase } from '../src/db.js';
 
 export default async function handler(request: any, response: any) {
   try {
@@ -12,7 +12,7 @@ export default async function handler(request: any, response: any) {
         response.setHeader('Content-Type', 'application/json; charset=utf-8');
         response.end(JSON.stringify({ status: 'ready', service: 'lalapay-api' }));
       } catch (error) {
-        console.error('LalaPay readiness check failed:', error);
+        console.error('LalaPay readiness check failed:', error instanceof Error ? error.message : 'unknown error');
         response.statusCode = 503;
         response.setHeader('Content-Type', 'application/json; charset=utf-8');
         response.end(JSON.stringify({ status: 'not_ready', service: 'lalapay-api', database: false }));
@@ -23,7 +23,7 @@ export default async function handler(request: any, response: any) {
     await app.ready();
     app.server.emit('request', request, response);
   } catch (error) {
-    console.error('LalaPay Vercel handler failed:', error);
+    console.error('LalaPay Vercel handler failed:', error instanceof Error ? error.message : 'unknown error');
     if (!response.headersSent) {
       response.statusCode = 500;
       response.setHeader('Content-Type', 'application/json; charset=utf-8');
