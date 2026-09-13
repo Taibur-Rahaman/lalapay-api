@@ -5,10 +5,7 @@ let initialized = false;
 let initializationPromise: Promise<void> | undefined;
 
 export function getPool() {
-  if (!process.env.DATABASE_URL) {
-    throw new Error('DATABASE_URL is not configured');
-  }
-
+  if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is not configured');
   if (!pool) {
     pool = new Pool({
       connectionString: process.env.DATABASE_URL,
@@ -18,17 +15,15 @@ export function getPool() {
       ssl: process.env.DATABASE_SSL === 'false' ? false : { rejectUnauthorized: false },
     });
   }
-
   return pool;
 }
 
 export async function ensureDatabase() {
   if (initialized) return;
   if (initializationPromise) return initializationPromise;
-
   initializationPromise = (async () => {
     const db = getPool();
-    await db.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto;`);
+    await db.query('CREATE EXTENSION IF NOT EXISTS pgcrypto');
     await db.query(`
       CREATE TABLE IF NOT EXISTS payment_links (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -47,12 +42,8 @@ export async function ensureDatabase() {
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
-
-      CREATE INDEX IF NOT EXISTS payment_links_status_created_idx
-        ON payment_links (status, created_at DESC);
-
-      CREATE INDEX IF NOT EXISTS payment_links_expires_at_idx
-        ON payment_links (expires_at);
+      CREATE INDEX IF NOT EXISTS payment_links_status_created_idx ON payment_links (status, created_at DESC);
+      CREATE INDEX IF NOT EXISTS payment_links_expires_at_idx ON payment_links (expires_at);
 
       CREATE TABLE IF NOT EXISTS transactions (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -63,7 +54,7 @@ export async function ensureDatabase() {
         status VARCHAR(30) NOT NULL DEFAULT 'INITIATED',
         provider_payment_id VARCHAR(150) NULL,
         provider_transaction_id VARCHAR(150) NULL,
-        idempotency_key VARCHAR(150) NULL UNIQUE,
+        idempotency_key VARCHAR(150) NULL,
         customer_name VARCHAR(150) NULL,
         customer_email VARCHAR(320) NULL,
         customer_phone VARCHAR(30) NULL,
@@ -71,24 +62,15 @@ export async function ensureDatabase() {
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         completed_at TIMESTAMPTZ NULL
       );
-
-      ALTER TABLE transactions ADD COLUMN IF NOT EXISTS provider_payment_id VARCHAR(150);
-
-      CREATE INDEX IF NOT EXISTS transactions_payment_link_idx
-        ON transactions (payment_link_id, created_at DESC);
-
-      CREATE INDEX IF NOT EXISTS transactions_provider_payment_idx
-        ON transactions (provider, provider_payment_id);
-
-      CREATE INDEX IF NOT EXISTS transactions_provider_tx_idx
-        ON transactions (provider, provider_transaction_id);
+      ALTER TABLE transactions ADD COLUMN IF NOT EXISTS provider_payment_id VARCHAR(150) NULL;
+      ALTER TABLE transactions ADD COLUMN IF NOT EXISTS provider_transaction_id VARCHAR(150) NULL;
+      ALTER TABLE transactions ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(150) NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS transactions_idempotency_unique_idx ON transactions (payment_link_id, provider, idempotency_key) WHERE idempotency_key IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS transactions_payment_link_idx ON transactions (payment_link_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS transactions_provider_payment_idx ON transactions (provider, provider_payment_id);
+      CREATE INDEX IF NOT EXISTS transactions_provider_tx_idx ON transactions (provider, provider_transaction_id);
     `);
     initialized = true;
   })();
-
-  try {
-    await initializationPromise;
-  } finally {
-    initializationPromise = undefined;
-  }
+  try { await initializationPromise; } finally { initializationPromise = undefined; }
 }
