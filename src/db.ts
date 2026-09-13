@@ -25,10 +25,21 @@ export async function ensureDatabase() {
     const db = getPool();
     await db.query('CREATE EXTENSION IF NOT EXISTS pgcrypto');
     await db.query(`
+      CREATE TABLE IF NOT EXISTS merchants (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        name VARCHAR(150) NOT NULL,
+        email VARCHAR(320) NOT NULL UNIQUE,
+        password_hash TEXT NOT NULL,
+        status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS merchants_status_idx ON merchants(status);
+
       CREATE TABLE IF NOT EXISTS payment_links (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         public_id VARCHAR(32) NOT NULL UNIQUE,
-        merchant_id UUID NULL,
+        merchant_id UUID NULL REFERENCES merchants(id) ON DELETE SET NULL,
         title VARCHAR(150) NOT NULL,
         amount NUMERIC(18,2) NOT NULL CHECK (amount > 0),
         currency CHAR(3) NOT NULL DEFAULT 'BDT',
@@ -44,6 +55,7 @@ export async function ensureDatabase() {
       );
       CREATE INDEX IF NOT EXISTS payment_links_status_created_idx ON payment_links (status, created_at DESC);
       CREATE INDEX IF NOT EXISTS payment_links_expires_at_idx ON payment_links (expires_at);
+      CREATE INDEX IF NOT EXISTS payment_links_merchant_created_idx ON payment_links (merchant_id, created_at DESC);
 
       CREATE TABLE IF NOT EXISTS transactions (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
