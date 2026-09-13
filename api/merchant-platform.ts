@@ -1,10 +1,11 @@
-import { randomBytes, createHash } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { ensureDatabase, getPool } from '../src/db.js';
 import { ensureMerchantPlatform, handleMerchantPlatform, handleAdminRoute } from '../src/merchant-platform.js';
 import { getCookie, verifyAuthToken, SESSION_COOKIE, CSRF_COOKIE } from '../src/auth.js';
 
 const hash=(v:string)=>createHash('sha256').update(v).digest('hex');
 function json(res:any,status:number,data:any){res.statusCode=status;res.setHeader('Content-Type','application/json; charset=utf-8');res.end(JSON.stringify(data));}
+function requestPath(req:any){return String(req.headers?.['x-vercel-original-url']||req.headers?.['x-original-url']||req.headers?.['x-matched-path']||req.url||'').split('?')[0];}
 async function merchantSession(req:any){
   const token=getCookie(req,SESSION_COOKIE); if(!token) return null;
   const auth=verifyAuthToken(token); if(!auth) return null;
@@ -20,7 +21,7 @@ async function merchantSession(req:any){
 export default async function handler(req:any,res:any){
   try{
     await ensureDatabase(); await ensureMerchantPlatform();
-    const path=String(req.url||'').split('?')[0];
+    const path=requestPath(req);
     if(path.startsWith('/api/v1/admin/')){
       if(await handleAdminRoute(req,res))return;
       return json(res,401,{success:false,message:'Admin authentication required'});
