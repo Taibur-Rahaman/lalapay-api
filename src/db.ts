@@ -41,7 +41,22 @@ export async function ensureDatabase() {
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(), name VARCHAR(150) NOT NULL, email VARCHAR(320) NOT NULL UNIQUE,
         password_hash TEXT NOT NULL, status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
+      ALTER TABLE merchants ADD COLUMN IF NOT EXISTS email_verified_at TIMESTAMPTZ NULL;
+      ALTER TABLE merchants ADD COLUMN IF NOT EXISTS auth_version INTEGER NOT NULL DEFAULT 1;
       CREATE INDEX IF NOT EXISTS merchants_status_idx ON merchants(status);
+      CREATE TABLE IF NOT EXISTS auth_sessions (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(), merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
+        token_hash CHAR(64) NOT NULL UNIQUE, csrf_token CHAR(64) NOT NULL,
+        expires_at TIMESTAMPTZ NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), revoked_at TIMESTAMPTZ NULL
+      );
+      CREATE INDEX IF NOT EXISTS auth_sessions_merchant_idx ON auth_sessions(merchant_id, expires_at DESC);
+      CREATE INDEX IF NOT EXISTS auth_sessions_active_idx ON auth_sessions(token_hash) WHERE revoked_at IS NULL;
+      CREATE TABLE IF NOT EXISTS auth_tokens (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(), merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
+        token_hash CHAR(64) NOT NULL UNIQUE, purpose VARCHAR(30) NOT NULL CHECK (purpose IN ('PASSWORD_RESET','EMAIL_VERIFICATION')),
+        expires_at TIMESTAMPTZ NOT NULL, used_at TIMESTAMPTZ NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS auth_tokens_lookup_idx ON auth_tokens(token_hash, purpose, expires_at) WHERE used_at IS NULL;
       CREATE TABLE IF NOT EXISTS payment_links (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(), public_id VARCHAR(32) NOT NULL UNIQUE, merchant_id UUID NULL REFERENCES merchants(id) ON DELETE SET NULL,
         title VARCHAR(150) NOT NULL, amount NUMERIC(18,2) NOT NULL CHECK (amount > 0), currency CHAR(3) NOT NULL DEFAULT 'BDT', description TEXT NULL,
@@ -74,30 +89,21 @@ export async function ensureDatabase() {
       CREATE UNIQUE INDEX IF NOT EXISTS transactions_idempotency_unique_idx ON transactions(merchant_id, idempotency_key) WHERE idempotency_key IS NOT NULL AND merchant_id IS NOT NULL;
       CREATE UNIQUE INDEX IF NOT EXISTS transactions_provider_payment_unique_idx ON transactions(provider, provider_payment_id) WHERE provider_payment_id IS NOT NULL;
       CREATE UNIQUE INDEX IF NOT EXISTS transactions_provider_tx_unique_idx ON transactions(provider, provider_transaction_id) WHERE provider_transaction_id IS NOT NULL;
-
       CREATE OR REPLACE FUNCTION lalapay_transaction_guard() RETURNS trigger AS $fn$
       BEGIN
         IF TG_OP = 'INSERT' THEN
-          IF NEW.merchant_id IS NULL THEN
-            SELECT merchant_id INTO NEW.merchant_id FROM payment_links WHERE id = NEW.payment_link_id;
-          END IF;
+          IF NEW.merchant_id IS NULL THEN SELECT merchant_id INTO NEW.merchant_id FROM payment_links WHERE id = NEW.payment_link_id; END IF;
           RETURN NEW;
         END IF;
-
-        -- SUCCESS is terminal. Any stale failure/pending callback becomes a no-op.
         IF OLD.status = 'SUCCESS' AND NEW.status <> 'SUCCESS' THEN RETURN OLD; END IF;
-
-        -- Provider identifiers are immutable once assigned.
         IF OLD.provider_payment_id IS NOT NULL AND NEW.provider_payment_id IS DISTINCT FROM OLD.provider_payment_id THEN RETURN OLD; END IF;
         IF OLD.provider_transaction_id IS NOT NULL AND NEW.provider_transaction_id IS DISTINCT FROM OLD.provider_transaction_id THEN RETURN OLD; END IF;
-
         NEW.updated_at := NOW();
         IF NEW.status = 'SUCCESS' THEN NEW.completed_at := COALESCE(OLD.completed_at, NEW.completed_at, NOW()); END IF;
         IF OLD.status = 'SUCCESS' THEN NEW.completed_at := OLD.completed_at; END IF;
         RETURN NEW;
       END;
       $fn$ LANGUAGE plpgsql;
-
       DROP TRIGGER IF EXISTS transactions_guard_trigger ON transactions;
       CREATE TRIGGER transactions_guard_trigger BEFORE INSERT OR UPDATE ON transactions FOR EACH ROW EXECUTE FUNCTION lalapay_transaction_guard();
     `);
