@@ -20,9 +20,7 @@ export function getPool() {
       allowExitOnIdle: true,
       ssl: process.env.DATABASE_SSL === 'false' ? false : { rejectUnauthorized: false },
     });
-    pool.on('error', (error) => {
-      console.error('LalaPay database pool error:', error.message);
-    });
+    pool.on('error', (error) => console.error('LalaPay database pool error:', error.message));
   }
   return pool;
 }
@@ -79,28 +77,30 @@ export async function ensureDatabase() {
 
       CREATE OR REPLACE FUNCTION lalapay_transaction_guard() RETURNS trigger AS $fn$
       BEGIN
-        IF TG_OP = 'UPDATE' THEN
-          -- Terminal states cannot be changed by stale callbacks or retries.
-          IF OLD.status = 'SUCCESS' AND NEW.status <> 'SUCCESS' THEN RETURN OLD; END IF;
-          IF OLD.status = 'FAILED' AND NEW.status NOT IN ('FAILED') THEN RETURN OLD; END IF;
-          IF OLD.status = 'SUCCESS' AND NEW.provider_transaction_id IS DISTINCT FROM OLD.provider_transaction_id THEN RETURN OLD; END IF;
-          IF OLD.status = 'SUCCESS' AND NEW.completed_at IS DISTINCT FROM OLD.completed_at THEN NEW.completed_at := OLD.completed_at; END IF;
+        IF TG_OP = 'INSERT' THEN
+          IF NEW.merchant_id IS NULL THEN
+            SELECT merchant_id INTO NEW.merchant_id FROM payment_links WHERE id = NEW.payment_link_id;
+          END IF;
+          RETURN NEW;
         END IF;
+
+        -- SUCCESS and FAILED are terminal. Stale callbacks become harmless no-ops.
+        IF OLD.status = 'SUCCESS' AND NEW.status <> 'SUCCESS' THEN RETURN OLD; END IF;
+        IF OLD.status = 'FAILED' AND NEW.status <> 'FAILED' THEN RETURN OLD; END IF;
 
         -- Provider identifiers are immutable once assigned.
         IF OLD.provider_payment_id IS NOT NULL AND NEW.provider_payment_id IS DISTINCT FROM OLD.provider_payment_id THEN RETURN OLD; END IF;
         IF OLD.provider_transaction_id IS NOT NULL AND NEW.provider_transaction_id IS DISTINCT FROM OLD.provider_transaction_id THEN RETURN OLD; END IF;
 
         NEW.updated_at := NOW();
-        IF NEW.status = 'SUCCESS' THEN
-          NEW.completed_at := COALESCE(OLD.completed_at, NEW.completed_at, NOW());
-        END IF;
+        IF NEW.status = 'SUCCESS' THEN NEW.completed_at := COALESCE(OLD.completed_at, NEW.completed_at, NOW()); END IF;
+        IF OLD.status = 'SUCCESS' THEN NEW.completed_at := OLD.completed_at; END IF;
         RETURN NEW;
       END;
       $fn$ LANGUAGE plpgsql;
 
       DROP TRIGGER IF EXISTS transactions_guard_trigger ON transactions;
-      CREATE TRIGGER transactions_guard_trigger BEFORE UPDATE ON transactions FOR EACH ROW EXECUTE FUNCTION lalapay_transaction_guard();
+      CREATE TRIGGER transactions_guard_trigger BEFORE INSERT OR UPDATE ON transactions FOR EACH ROW EXECUTE FUNCTION lalapay_transaction_guard();
     `);
     initialized = true;
   })();
