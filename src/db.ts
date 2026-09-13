@@ -84,9 +84,8 @@ export async function ensureDatabase() {
           RETURN NEW;
         END IF;
 
-        -- SUCCESS and FAILED are terminal. Stale callbacks become harmless no-ops.
+        -- SUCCESS is terminal. Any stale failure/pending callback becomes a no-op.
         IF OLD.status = 'SUCCESS' AND NEW.status <> 'SUCCESS' THEN RETURN OLD; END IF;
-        IF OLD.status = 'FAILED' AND NEW.status <> 'FAILED' THEN RETURN OLD; END IF;
 
         -- Provider identifiers are immutable once assigned.
         IF OLD.provider_payment_id IS NOT NULL AND NEW.provider_payment_id IS DISTINCT FROM OLD.provider_payment_id THEN RETURN OLD; END IF;
