@@ -61,6 +61,7 @@ export async function ensureDatabase() {
         amount NUMERIC(18,2) NOT NULL CHECK (amount > 0),
         currency CHAR(3) NOT NULL DEFAULT 'BDT',
         status VARCHAR(30) NOT NULL DEFAULT 'INITIATED',
+        provider_payment_id VARCHAR(150) NULL,
         provider_transaction_id VARCHAR(150) NULL,
         idempotency_key VARCHAR(150) NULL UNIQUE,
         customer_name VARCHAR(150) NULL,
@@ -71,8 +72,13 @@ export async function ensureDatabase() {
         completed_at TIMESTAMPTZ NULL
       );
 
+      ALTER TABLE transactions ADD COLUMN IF NOT EXISTS provider_payment_id VARCHAR(150);
+
       CREATE INDEX IF NOT EXISTS transactions_payment_link_idx
         ON transactions (payment_link_id, created_at DESC);
+
+      CREATE INDEX IF NOT EXISTS transactions_provider_payment_idx
+        ON transactions (provider, provider_payment_id);
 
       CREATE INDEX IF NOT EXISTS transactions_provider_tx_idx
         ON transactions (provider, provider_transaction_id);
