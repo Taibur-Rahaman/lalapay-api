@@ -1,7 +1,7 @@
 let appPromise: Promise<any> | undefined;
 
 async function getApp() {
-  appPromise ??= import('../src/server.js').then(({ app }) => app);
+  appPromise ??= import('../dist/server.js').then(({ app }) => app);
   return appPromise;
 }
 
@@ -9,7 +9,7 @@ export default async function handler(request: any, response: any) {
   try {
     const path = String(request.url ?? '').split('?')[0];
     if (path === '/health/ready') {
-      const { pingDatabase } = await import('../src/db.js');
+      const { pingDatabase } = await import('../dist/db.js');
       try {
         await pingDatabase();
         response.statusCode = 200;
