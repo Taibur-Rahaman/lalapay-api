@@ -68,6 +68,7 @@ export async function ensureDatabase() {
       CREATE UNIQUE INDEX IF NOT EXISTS transactions_provider_payment_unique_idx ON transactions(provider, provider_payment_id) WHERE provider_payment_id IS NOT NULL;
       CREATE UNIQUE INDEX IF NOT EXISTS transactions_provider_tx_unique_idx ON transactions(provider, provider_transaction_id) WHERE provider_transaction_id IS NOT NULL;
       CREATE INDEX IF NOT EXISTS transactions_payment_link_idx ON transactions(payment_link_id, created_at DESC, id);
+      CREATE INDEX IF NOT EXISTS transactions_payment_link_status_idx ON transactions(payment_link_id, status, created_at DESC);
       CREATE INDEX IF NOT EXISTS transactions_provider_payment_idx ON transactions(provider, provider_payment_id);
       CREATE INDEX IF NOT EXISTS transactions_provider_tx_idx ON transactions(provider, provider_transaction_id);
     `);
