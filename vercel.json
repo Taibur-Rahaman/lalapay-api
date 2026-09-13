@@ -2,6 +2,19 @@
   "version": 2,
   "rewrites": [
     { "source": "/api/reconcile", "destination": "/api/reconcile.ts" },
+    { "source": "/api/v1/admin/:path*", "destination": "/api/merchant-platform.ts" },
+    { "source": "/api/v1/merchant/business-profile", "destination": "/api/merchant-platform.ts" },
+    { "source": "/api/v1/merchant/kyc", "destination": "/api/merchant-platform.ts" },
+    { "source": "/api/v1/merchant/balance", "destination": "/api/merchant-platform.ts" },
+    { "source": "/api/v1/merchant/ledger", "destination": "/api/merchant-platform.ts" },
+    { "source": "/api/v1/merchant/settlements", "destination": "/api/merchant-platform.ts" },
+    { "source": "/api/v1/merchant/payouts", "destination": "/api/merchant-platform.ts" },
+    { "source": "/api/v1/merchant/refunds", "destination": "/api/merchant-platform.ts" },
+    { "source": "/api/v1/merchant/webhooks", "destination": "/api/merchant-platform.ts" },
+    { "source": "/api/v1/merchant/webhook-deliveries", "destination": "/api/merchant-platform.ts" },
+    { "source": "/api/v1/merchant/api-keys", "destination": "/api/merchant-platform.ts" },
+    { "source": "/api/v1/merchant/api-keys/:path*", "destination": "/api/merchant-platform.ts" },
+    { "source": "/api/v1/merchant/transactions/:id/refund", "destination": "/api/merchant-platform.ts" },
     { "source": "/(.*)", "destination": "/api/index.ts" }
   ]
 }
