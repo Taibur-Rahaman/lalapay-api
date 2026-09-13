@@ -21,8 +21,8 @@ async function merchantSession(req:any){
 export default async function handler(req:any,res:any){
   try{
     await ensureDatabase(); await ensureMerchantPlatform();
-    const path=requestPath(req);
-    if(path.startsWith('/api/v1/admin/')){
+    const originalPath=requestPath(req); req.url=originalPath;
+    if(originalPath.startsWith('/api/v1/admin/')){
       if(await handleAdminRoute(req,res))return;
       return json(res,401,{success:false,message:'Admin authentication required'});
     }
