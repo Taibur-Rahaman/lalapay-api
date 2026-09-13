@@ -28,6 +28,7 @@ export async function ensureDatabase() {
 
   initializationPromise = (async () => {
     const db = getPool();
+    await db.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto;`);
     await db.query(`
       CREATE TABLE IF NOT EXISTS payment_links (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
