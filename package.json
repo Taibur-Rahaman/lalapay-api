@@ -1,6 +1,6 @@
 {
   "name": "lalapay-api",
-  "version": "0.2.0",
+  "version": "0.4.0",
   "private": true,
   "description": "LalaPay payment API for bKash and Nagad.",
   "type": "module",
@@ -10,9 +10,7 @@
     "start": "node dist/server.js",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
-  "engines": {
-    "node": "24.x"
-  },
+  "engines": { "node": "24.x" },
   "dependencies": {
     "@fastify/cors": "latest",
     "@fastify/helmet": "latest",
