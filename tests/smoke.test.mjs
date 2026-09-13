@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 process.env.VERCEL='1';
 process.env.NODE_ENV='test';
 
-const {app}=await import('../src/server.js');
+const {app}=await import('../dist/server.js');
 
 test('liveness health does not require database',async()=>{const r=await app.inject({method:'GET',url:'/health'});assert.equal(r.statusCode,200);const b=r.json();assert.equal(b.status,'ok');assert.equal(b.service,'lalapay-api');assert.equal(b.version,'0.9.0')});
 test('unknown route returns JSON 404',async()=>{const r=await app.inject({method:'GET',url:'/does-not-exist'});assert.equal(r.statusCode,404);assert.equal(r.json().success,false)});
