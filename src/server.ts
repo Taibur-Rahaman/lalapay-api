@@ -23,6 +23,8 @@ const paymentLinkSchema = z.object({
   if (value.expiresAt && new Date(value.expiresAt).getTime() <= Date.now()) ctx.addIssue({ code: 'custom', path: ['expiresAt'], message: 'expiresAt must be in the future' });
 });
 
+const idempotencySchema = z.string().trim().min(8).max(150);
+
 function publicId() { return randomBytes(9).toString('base64url'); }
 function serializeLink(row: any) {
   const expired = row.expires_at ? new Date(row.expires_at).getTime() <= Date.now() : false;
@@ -36,7 +38,7 @@ export function buildApp() {
   app.register(cors, { origin: process.env.FRONTEND_URL ? [process.env.FRONTEND_URL] : true, credentials: true });
   app.register(rateLimit, { max: 100, timeWindow: '1 minute' });
 
-  app.get('/health', async () => ({ status: 'ok', service: 'lalapay-api', version: '0.4.0', database: Boolean(process.env.DATABASE_URL), bkash: Boolean(process.env.BKASH_BASE_URL && process.env.BKASH_APP_KEY) }));
+  app.get('/health', async () => ({ status: 'ok', service: 'lalapay-api', version: '0.5.0', database: Boolean(process.env.DATABASE_URL), bkash: Boolean(process.env.BKASH_BASE_URL && process.env.BKASH_APP_KEY) }));
 
   app.post('/api/v1/payment-links', async (request, reply) => {
     const parsed = paymentLinkSchema.safeParse(request.body);
@@ -69,24 +71,39 @@ export function buildApp() {
 
   app.post('/api/v1/payment-links/:id/pay/bkash', async (request, reply) => {
     const params = z.object({ id: z.string().trim().min(8).max(32) }).safeParse(request.params);
+    const rawKey = request.headers['idempotency-key'];
+    const idempotencyKey = typeof rawKey === 'string' ? idempotencySchema.safeParse(rawKey) : null;
     if (!params.success) return reply.code(400).send({ success: false, message: 'Invalid payment link id' });
+    if (!idempotencyKey?.success) return reply.code(400).send({ success: false, message: 'Idempotency-Key header is required and must be 8-150 characters' });
+
     try {
       await ensureDatabase();
-      const link = await getPool().query('SELECT * FROM payment_links WHERE public_id=$1 LIMIT 1', [params.data.id]);
+      const db = getPool();
+      const link = await db.query('SELECT * FROM payment_links WHERE public_id=$1 LIMIT 1', [params.data.id]);
       if (!link.rowCount) return reply.code(404).send({ success: false, message: 'Payment link not found' });
       const row = link.rows[0];
       if (row.status !== 'ACTIVE' || isExpired(row)) return reply.code(410).send({ success: false, message: 'Payment link is expired or inactive' });
       if (!row.payment_methods.includes('bkash')) return reply.code(400).send({ success: false, message: 'bKash is not enabled for this payment link' });
 
+      const key = `bkash:${params.data.id}:${idempotencyKey.data}`;
+      const existing = await db.query(`SELECT id,status,provider_payment_id,provider_transaction_id FROM transactions WHERE idempotency_key=$1 LIMIT 1`, [key]);
+      if (existing.rowCount) {
+        const tx = existing.rows[0];
+        if (tx.status === 'SUCCESS' || tx.status === 'PENDING' || tx.status === 'INITIATED') {
+          return reply.send({ success: true, data: { transactionId: tx.id, paymentId: tx.provider_payment_id, redirectUrl: null, provider: 'bkash', status: tx.status, reused: true } });
+        }
+        await db.query('DELETE FROM transactions WHERE id=$1', [tx.id]);
+      }
+
       const txId = randomUUID();
-      const created = await getPool().query(`INSERT INTO transactions (id,payment_link_id,provider,amount,currency,status,idempotency_key,customer_name,customer_email,customer_phone) VALUES ($1,$2,'bkash',$3,'BDT','INITIATED',$4,$5,$6,$7) RETURNING id`, [txId, row.id, row.amount, `bkash:${txId}`, row.customer_name, row.customer_email, row.customer_phone]);
+      const created = await db.query(`INSERT INTO transactions (id,payment_link_id,provider,amount,currency,status,idempotency_key,customer_name,customer_email,customer_phone) VALUES ($1,$2,'bkash',$3,'BDT','INITIATED',$4,$5,$6,$7) RETURNING id`, [txId, row.id, row.amount, key, row.customer_name, row.customer_email, row.customer_phone]);
       try {
         const payment = await createBkashPayment({ amount: Number(row.amount).toFixed(2), invoice: txId, payerReference: row.customer_phone ?? txId });
         if (!payment.paymentID || !payment.bkashURL) throw new Error(payment.statusMessage ?? 'Invalid bKash create response');
-        await getPool().query('UPDATE transactions SET provider_transaction_id=$1,status=\'PENDING\',updated_at=NOW() WHERE id=$2', [payment.paymentID, created.rows[0].id]);
-        return reply.send({ success: true, data: { transactionId: txId, paymentId: payment.paymentID, redirectUrl: payment.bkashURL, provider: 'bkash', status: 'PENDING' } });
+        await db.query('UPDATE transactions SET provider_payment_id=$1,status=\'PENDING\',updated_at=NOW() WHERE id=$2', [payment.paymentID, created.rows[0].id]);
+        return reply.send({ success: true, data: { transactionId: txId, paymentId: payment.paymentID, redirectUrl: payment.bkashURL, provider: 'bkash', status: 'PENDING', reused: false } });
       } catch (providerError) {
-        await getPool().query('UPDATE transactions SET status=\'FAILED\',updated_at=NOW() WHERE id=$1', [txId]);
+        await db.query('UPDATE transactions SET status=\'FAILED\',updated_at=NOW() WHERE id=$1', [txId]);
         throw providerError;
       }
     } catch (error) { request.log.error(error); return reply.code(502).send({ success: false, message: 'Unable to initialize bKash payment' }); }
@@ -97,19 +114,30 @@ export function buildApp() {
     if (!query.success) return reply.code(400).send({ success: false, message: 'Invalid bKash callback' });
     try {
       await ensureDatabase();
-      const tx = await getPool().query('SELECT * FROM transactions WHERE provider=\'bkash\' AND provider_transaction_id=$1 LIMIT 1', [query.data.paymentID]);
+      const db = getPool();
+      const tx = await db.query('SELECT * FROM transactions WHERE provider=\'bkash\' AND provider_payment_id=$1 LIMIT 1', [query.data.paymentID]);
       if (!tx.rowCount) return reply.code(404).send({ success: false, message: 'Transaction not found' });
+      const transaction = tx.rows[0];
+      if (transaction.status === 'SUCCESS') return reply.redirect(303, `${process.env.FRONTEND_URL ?? ''}/pay/success?transaction=${encodeURIComponent(transaction.id)}`);
+
       if (query.data.status === 'cancel' || query.data.status === 'failure') {
-        await getPool().query('UPDATE transactions SET status=\'FAILED\',updated_at=NOW() WHERE id=$1 AND status<>\'SUCCESS\'', [tx.rows[0].id]);
+        await db.query('UPDATE transactions SET status=\'FAILED\',updated_at=NOW() WHERE id=$1 AND status<>\'SUCCESS\'', [transaction.id]);
       } else {
-        const executed = await executeBkashPayment(query.data.paymentID);
+        let executed: any;
+        try {
+          executed = await executeBkashPayment(query.data.paymentID);
+        } catch (executeError) {
+          request.log.warn({ executeError }, 'bKash execute failed; checking payment status');
+          executed = await queryBkashPayment(query.data.paymentID);
+        }
         const success = executed.transactionStatus === 'Completed' || executed.statusCode === '0000';
-        if (success) await getPool().query('UPDATE transactions SET status=\'SUCCESS\',provider_transaction_id=COALESCE($1,provider_transaction_id),updated_at=NOW(),completed_at=NOW() WHERE id=$2', [executed.trxID ?? null, tx.rows[0].id]);
-        else await getPool().query('UPDATE transactions SET status=\'FAILED\',updated_at=NOW() WHERE id=$1', [tx.rows[0].id]);
+        if (success) await db.query('UPDATE transactions SET status=\'SUCCESS\',provider_transaction_id=COALESCE($1,provider_transaction_id),updated_at=NOW(),completed_at=NOW() WHERE id=$2', [executed.trxID ?? null, transaction.id]);
+        else if (executed.transactionStatus === 'Initiated' || executed.transactionStatus === 'Pending') await db.query('UPDATE transactions SET status=\'PENDING\',updated_at=NOW() WHERE id=$1', [transaction.id]);
+        else await db.query('UPDATE transactions SET status=\'FAILED\',updated_at=NOW() WHERE id=$1', [transaction.id]);
       }
       const frontend = process.env.FRONTEND_URL;
-      if (frontend) return reply.redirect(303, `${frontend}/pay/success?transaction=${encodeURIComponent(tx.rows[0].id)}`);
-      return reply.send({ success: true, transactionId: tx.rows[0].id });
+      if (frontend) return reply.redirect(303, `${frontend}/pay/success?transaction=${encodeURIComponent(transaction.id)}`);
+      return reply.send({ success: true, transactionId: transaction.id });
     } catch (error) { request.log.error(error); return reply.code(502).send({ success: false, message: 'Unable to complete bKash payment' }); }
   });
 
@@ -118,7 +146,7 @@ export function buildApp() {
     if (!params.success) return reply.code(400).send({ success: false, message: 'Invalid transaction id' });
     try {
       await ensureDatabase();
-      const result = await getPool().query('SELECT id,provider,amount,currency,status,provider_transaction_id,created_at,updated_at,completed_at FROM transactions WHERE id=$1 LIMIT 1', [params.data.id]);
+      const result = await getPool().query('SELECT id,provider,amount,currency,status,provider_payment_id,provider_transaction_id,created_at,updated_at,completed_at FROM transactions WHERE id=$1 LIMIT 1', [params.data.id]);
       if (!result.rowCount) return reply.code(404).send({ success: false, message: 'Transaction not found' });
       return reply.send({ success: true, data: result.rows[0] });
     } catch (error) { request.log.error(error); return reply.code(503).send({ success: false, message: 'Database is unavailable' }); }
