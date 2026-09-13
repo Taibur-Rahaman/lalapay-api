@@ -1,5 +1,8 @@
 {
   "version": 2,
+  "crons": [
+    { "path": "/api/reconcile", "schedule": "*/5 * * * *" }
+  ],
   "rewrites": [
     { "source": "/api/reconcile", "destination": "/api/reconcile.ts" },
     { "source": "/api/v1/admin/:path*", "destination": "/api/merchant-platform.ts" },
