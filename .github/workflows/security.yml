@@ -16,8 +16,13 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
+          cache: npm
       - run: npm install
       - name: Dependency audit
         run: npm audit --audit-level=high
       - name: Typecheck
         run: npm run typecheck
+      - name: Production build
+        run: npm run build
+      - name: Smoke tests
+        run: npm run test:smoke
