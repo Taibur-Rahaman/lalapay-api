@@ -9,6 +9,7 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/server.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck:vercel": "tsc -p tsconfig.vercel.json",
     "test:smoke": "npm run build && node --test tests/*.test.mjs",
     "test:load": "node scripts/load-test.mjs"
   },
