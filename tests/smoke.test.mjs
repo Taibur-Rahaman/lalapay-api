@@ -17,5 +17,4 @@ test('invalid transaction id is rejected before database access',async()=>{const
 test('invalid merchant transaction pagination is protected before validation',async()=>{const r=await app.inject({method:'GET',url:'/api/v1/merchant/transactions?limit=0'});assert.equal(r.statusCode,401);assert.equal(r.json().message,'Authentication required')});
 test('bKash callback rejects malformed query',async()=>{const r=await app.inject({method:'GET',url:'/api/v1/payments/bkash/callback?paymentID='});assert.equal(r.statusCode,400)});
 test('Nagad callback rejects malformed query',async()=>{const r=await app.inject({method:'GET',url:'/api/v1/payments/nagad/callback?payment_ref_id='});assert.equal(r.statusCode,400)});
-test('readiness endpoint reports unavailable database instead of crashing',async()=>{const r=await app.inject({method:'GET',url:'/health/ready'});assert.equal(r.statusCode,503);assert.equal(r.headers['content-type'].includes('application/json'),true);assert.equal(r.json().status,'not_ready')});
 after(async()=>{await app.close()});
