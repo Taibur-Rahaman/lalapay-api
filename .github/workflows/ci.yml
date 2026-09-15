@@ -24,6 +24,9 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      - name: Typecheck Vercel functions
+        run: npm run typecheck:vercel
+
       - name: Build
         run: npm run build
 
