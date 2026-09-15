@@ -1,7 +1,7 @@
 {
   "version": 2,
   "rewrites": [
-    { "source": "/health/ready", "destination": "/api/index" },
+    { "source": "/health/ready", "destination": "/api/health-ready" },
     { "source": "/api/v1/:path*", "destination": "/api/index" }
   ],
   "crons": [
