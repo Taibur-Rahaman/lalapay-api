@@ -8,10 +8,20 @@
     "api/health-ready.ts": {
       "maxDuration": 10,
       "memory": 512
+    },
+    "api/whmcs-payments.ts": {
+      "maxDuration": 30,
+      "memory": 512
+    },
+    "api/whmcs-payment-status.ts": {
+      "maxDuration": 15,
+      "memory": 512
     }
   },
   "rewrites": [
     { "source": "/health/ready", "destination": "/api/health-ready" },
+    { "source": "/api/v1/integrations/whmcs/payments", "destination": "/api/whmcs-payments" },
+    { "source": "/api/v1/integrations/whmcs/payment-status", "destination": "/api/whmcs-payment-status" },
     { "source": "/api/v1/:path*", "destination": "/api/index" }
   ],
   "crons": [
